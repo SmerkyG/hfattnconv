@@ -7,7 +7,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Traine
 from transformers.trainer_callback import TrainerCallback
 from datasets import load_dataset
 from configs import parse_cmdline_configs
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pydoc import locate
 
 from rwkv6attn import RWKV6Attention
@@ -22,7 +22,7 @@ class Train_Config:
     teacher_model_path: str = ''
     sequence_length: int = 512
     token_count: int = 40_000_000
-    training_args: TrainingArguments = TrainingArguments(output_dir='out', bf16=True, per_device_train_batch_size=4, gradient_checkpointing=False, include_tokens_per_second=True, learning_rate=1e-3, adam_beta1=0.9, adam_beta2=0.95, lr_scheduler_type='cosine')
+    training_args: TrainingArguments = field(default_factory=lambda: TrainingArguments(output_dir='out', bf16=True, per_device_train_batch_size=4, gradient_checkpointing=False, include_tokens_per_second=True, learning_rate=1e-3, adam_beta1=0.9, adam_beta2=0.95, lr_scheduler_type='cosine'))
 
 @dataclass(kw_only=True)
 class CLI_Config:
@@ -30,7 +30,7 @@ class CLI_Config:
     model_path: str
     attn_classes_path: str = 'transformers.models.qwen2.modeling_qwen2.QWEN2_ATTENTION_CLASSES' # 'transformers.models.llama.modeling_llama.LLAMA_ATTENTION_CLASSES' 
     seed: int = 1337
-    train: Train_Config = Train_Config()
+    train: Train_Config = field(default_factory=lambda: Train_Config())
     eval: bool = False
 
 class SelfAttentionDistillationWrapper(nn.Module):
