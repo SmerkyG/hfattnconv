@@ -1,0 +1,23 @@
+tokenizer_path: Qwen/Qwen2.5-0.5B
+attn_classes_path: transformers.models.qwen2.modeling_qwen2.QWEN2_ATTENTION_CLASSES
+model_path: ./out2
+train:
+  attention_distillation_stage: 3
+  teacher_model_path: Qwen/Qwen2.5-0.5B
+  output_dir: out3
+  sequence_length: 512
+  train_dataset_path: robbiegwaldd/dclm-10B
+  token_count: 10000000 #40000000
+  training_args:
+    output_dir: out
+    bf16: True
+    per_device_train_batch_size: 12
+    gradient_checkpointing: True
+    learning_rate: 1e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    lr_scheduler_type: cosine
+    warmup_steps: 50
+    save_total_limit: 1
+    include_tokens_per_second: True
+    logging_steps: 10
