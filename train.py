@@ -10,7 +10,7 @@ from configs import parse_cmdline_configs
 from dataclasses import dataclass, field
 from pydoc import locate
 
-from rwkv6attn import RWKV6Attention
+from rwkv6attn import load_and_patch_model_with_RWKV6
 
 @dataclass(kw_only=True)
 class Train_Config:
@@ -22,7 +22,7 @@ class Train_Config:
     teacher_model_path: str = ''
     sequence_length: int = 512
     token_count: int = 40_000_000
-    training_args: TrainingArguments = field(default_factory=lambda: TrainingArguments(output_dir='out', bf16=True, per_device_train_batch_size=4, gradient_checkpointing=False, include_tokens_per_second=True, learning_rate=1e-3, adam_beta1=0.9, adam_beta2=0.95, lr_scheduler_type='cosine'))
+    training_args: TrainingArguments = field(default_factory=lambda: TrainingArguments(output_dir='out', bf16=True, per_device_train_batch_size=4, gradient_checkpointing=False, include_tokens_per_second=True, learning_rate=1e-3, adam_beta1=0.9, adam_beta2=0.95, lr_scheduler_type='cosine', dataloader_num_workers=8))
 
 @dataclass(kw_only=True)
 class CLI_Config:
@@ -32,56 +32,6 @@ class CLI_Config:
     seed: int = 1337
     train: Train_Config = field(default_factory=lambda: Train_Config())
     eval: bool = False
-
-class SelfAttentionDistillationWrapper(nn.Module):
-    def __init__(self, original_self_attn:nn.Module, model_config:Any, attention_distillation_stage:int):
-        super().__init__()
-        self.teacher_attn = original_self_attn
-        self.student_attn = RWKV6Attention(model_config, original_self_attn.layer_idx)
-        assert attention_distillation_stage in (1, 2)
-        self.attention_distillation_stage = attention_distillation_stage
-
-        # copy in teacher's starting parameter values into student during stage 1
-        if attention_distillation_stage == 1:
-            student_params_dict = dict(self.student_attn.named_parameters())
-            for n, p in self.teacher_attn.named_parameters():
-                if n in student_params_dict:
-                    student_params_dict[n].requires_grad_(False)
-                    student_params_dict[n].copy_(p)
-                    student_params_dict[n].requires_grad_(True)
-
-    def forward(self, 
-        # hidden_states: torch.Tensor,
-        # attention_mask: Optional[torch.Tensor] = None,
-        # position_ids: Optional[torch.LongTensor] = None,
-        # past_key_value: Optional[Cache] = None,
-        # output_attentions: bool = False,
-        # use_cache: bool = False,
-        # cache_position: Optional[torch.LongTensor] = None,
-        # position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
-        *args,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if self.attention_distillation_stage == 2:
-            # we don't need these for stage 2, only stage 1
-            kwargs['output_attentions'] = False
-
-        # NOTE - instead of returning attentions here we return a special attention loss
-        student_outputs = self.student_attn(*args, **kwargs)
-        teacher_outputs = self.teacher_attn(*args, **kwargs)
-        assert self.attention_distillation_stage in (1,2)
-        if self.attention_distillation_stage == 1:
-            # a) special attention loss is the matrix_norm of the student and teacher attentions
-            student_attentions = student_outputs[1]
-            teacher_attentions = teacher_outputs[1]
-            special_attn_loss = torch.linalg.matrix_norm(teacher_attentions - student_attentions).mean() / teacher_attentions[0].size(-1)
-        else: # self.attention_distillation_stage == 2:
-            # b) special attention loss is the vector norm of the difference between the student and teacher attn outputs
-            student_hidden_states = student_outputs[0]
-            teacher_hidden_states = teacher_outputs[0]
-            special_attn_loss = torch.linalg.vector_norm(teacher_hidden_states - student_hidden_states, dim=-1).mean() * (teacher_hidden_states[0].size(-1) ** -0.5)
-
-        return (teacher_outputs[0], special_attn_loss, ) + teacher_outputs[2:]
 
 class RemoveTeacherCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, model, **kwargs):
@@ -194,81 +144,20 @@ def main():
 
     training_args = config.train.training_args
 
-    model_config = AutoConfig.from_pretrained(config.model_path)
-
-    # FIXME - hardcoded for now, but it'd be great if we could specify this in data somewhere per model type (or even analyze the weights to see)
-    # NOTE - when loading a custom Qwen2RWKV model we don't need to set model_config.attention_bias and model_config.attention_output_bias, because the model config contains it
-    if 'Qwen/Qwen' in config.model_path:
-        model_config.attention_bias = True
-        model_config.attention_output_bias = False
-
     attention_distillation_stage = config.train.attention_distillation_stage
 
-    # replace attention classes
-    attn_classes_dict = locate(config.attn_classes_path)
-    attn_classes_dict_original_copy:dict = attn_classes_dict.copy()
-    assert isinstance(attn_classes_dict, dict), 'could not find attention classes dict at path provided'
-    if attention_distillation_stage == 1:
-        pass
-    elif attention_distillation_stage == 2:
-        # replace all attention classes with SelfAttentionDistillationWrapper that will be passed an invocation of the original attention class to wrap
-        for key in list(attn_classes_dict.keys()):
-            cls = attn_classes_dict[key]
-            attn_classes_dict[key] = lambda *args, **kwargs: SelfAttentionDistillationWrapper(cls(*args, **kwargs), model_config, attention_distillation_stage)
-    elif attention_distillation_stage >= 3:
-        for key in list(attn_classes_dict.keys()):
-            attn_classes_dict[key] = RWKV6Attention
+    model = load_and_patch_model_with_RWKV6(config.model_path, config.model_path, config.attn_classes_path, attention_distillation_stage)
 
-    model = AutoModelForCausalLM.from_pretrained(config.model_path, config=model_config)
-
-    # reset attention classes for upcoming teacher module's use
-    for key, value in attn_classes_dict_original_copy.items():
-        attn_classes_dict[key] = value
-
-    # patch model
-    model.attention_distillation_stage = attention_distillation_stage
-    if attention_distillation_stage in (1, 2):
-        # requires_grad_(False) on entire model, so it acts as teacher
-        model.requires_grad_(False)
-
-        if attention_distillation_stage == 1:
-            # monkeypatch conditionally executed student attention replacements (which do require grad)
-            for layer in model.model.layers:
-                layer.self_attn = SelfAttentionDistillationWrapper(layer.self_attn, model_config, attention_distillation_stage)
-
-        # student attention replacements do require grad in both stages 1 and 2
-        for layer in model.model.layers:
-            layer.self_attn.student_attn.requires_grad_(True)
-
+    if attention_distillation_stage in (1, 2):               
         TrainerType = AttentionDistillationTrainer
         trainer_kwargs = {}
-
     elif attention_distillation_stage == 3:
-        if model_config.tie_word_embeddings:
-            # copy untied embeddings
-            model.get_output_embeddings().weight = nn.Parameter(model.get_input_embeddings().weight.clone())
-            # untie the embeddings in the config, too
-            model_config.tie_word_embeddings = False
-
         # traditional distillation, so we need to load a second teacher model for inference
         TrainerType = DistillationTrainer
         trainer_kwargs = dict(teacher=AutoModelForCausalLM.from_pretrained(config.train.teacher_model_path))
-
-    elif attention_distillation_stage == 4:
-        if model_config.tie_word_embeddings:
-            # copy untied embeddings
-            model.get_output_embeddings().weight = nn.Parameter(model.get_input_embeddings().weight.clone())
-            # untie the embeddings in the config, too
-            model_config.tie_word_embeddings = False
-
-        TrainerType = Trainer
-        trainer_kwargs = {}
-
     else:
         TrainerType = Trainer
         trainer_kwargs = {}
-
-    # FIXME - patch model's _init_weights function
 
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
     train_dataset = load_dataset(config.train.train_dataset_path, split=config.train.train_dataset_split, streaming=True)

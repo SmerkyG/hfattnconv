@@ -55,8 +55,9 @@ for key in list(attn_classes_dict.keys()):
 
 model = AutoModelForCausalLM.from_pretrained(config.model_path, config=model_config)
 
+# UNNECESSARY because leave the config saying that they're tied, so it will treat them as tied even though they're both saved
 # re-tie embeddings
-model.get_output_embeddings().weight = model.get_input_embeddings().weight
+#model.get_output_embeddings().weight = model.get_input_embeddings().weight
 
 tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
 

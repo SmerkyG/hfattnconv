@@ -24,7 +24,10 @@ from typing import Any, Optional, Tuple
 
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 
+from transformers import AutoConfig, AutoModel
+
 from fla.ops.gla.chunk import chunk_gla, ChunkGLAFunction
+from pydoc import locate
 
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
@@ -139,6 +142,16 @@ class RWKV6Attention(nn.Module):
 
         self.ln_x = nn.LayerNorm(dim_att)
 
+        # init weights for ln_x
+        p = self.ln_x.weight
+        requires_grad_temp = p.requires_grad
+        p.requires_grad_(False)
+        layer_scale = ((1+layer_idx) / n_layer) ** 0.7
+        #print('.ln_x.weight layer', layer_idx, "scale", layer_scale)
+        p *= 0.0
+        p += layer_scale
+        p.requires_grad = requires_grad_temp
+
     def segsum(self, w_log): # B H L 1
         w_log_cumsum = torch.cumsum(w_log, dim=-2) # (B, H, L, 1)
         w_mask = torch.exp((w_log_cumsum - w_log_cumsum.mT).tril()).tril() # (B, H, L, L)
@@ -235,3 +248,131 @@ class RWKV6Attention(nn.Module):
             attn_output = torch.empty(0, device=x.device)
 
         return attn_output, attn_weights, past_key_value
+
+class RWKV6AttentionDistillationWrapper(nn.Module):
+    def __init__(self, original_self_attn:nn.Module, model_config:Any, attention_distillation_stage:int):
+        super().__init__()
+        self.teacher_attn = original_self_attn
+        self.student_attn = RWKV6Attention(model_config, original_self_attn.layer_idx)
+        assert attention_distillation_stage in (1, 2)
+        self.attention_distillation_stage = attention_distillation_stage
+
+        # copy in teacher's starting parameter values into student during stage 1
+        if attention_distillation_stage == 1:
+            student_params_dict = dict(self.student_attn.named_parameters())
+            for n, p in self.teacher_attn.named_parameters():
+                if n in student_params_dict:
+                    student_params_dict[n].requires_grad_(False)
+                    student_params_dict[n].copy_(p)
+                    student_params_dict[n].requires_grad_(True)
+
+    def forward(self, 
+        # hidden_states: torch.Tensor,
+        # attention_mask: Optional[torch.Tensor] = None,
+        # position_ids: Optional[torch.LongTensor] = None,
+        # past_key_value: Optional[Cache] = None,
+        # output_attentions: bool = False,
+        # use_cache: bool = False,
+        # cache_position: Optional[torch.LongTensor] = None,
+        # position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        *args,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if self.attention_distillation_stage == 2:
+            # we don't need these for stage 2, only stage 1
+            kwargs['output_attentions'] = False
+
+        # NOTE - instead of returning attentions here we return a special attention loss
+        student_outputs = self.student_attn(*args, **kwargs)
+        teacher_outputs = self.teacher_attn(*args, **kwargs)
+        assert self.attention_distillation_stage in (1,2)
+        if self.attention_distillation_stage == 1:
+            # a) special attention loss is the matrix_norm of the student and teacher attentions
+            student_attentions = student_outputs[1]
+            teacher_attentions = teacher_outputs[1]
+            special_attn_loss = torch.linalg.matrix_norm(teacher_attentions - student_attentions).mean() / teacher_attentions[0].size(-1)
+        else: # self.attention_distillation_stage == 2:
+            # b) special attention loss is the vector norm of the difference between the student and teacher attn outputs
+            student_hidden_states = student_outputs[0]
+            teacher_hidden_states = teacher_outputs[0]
+            special_attn_loss = torch.linalg.vector_norm(teacher_hidden_states - student_hidden_states, dim=-1).mean() * (teacher_hidden_states[0].size(-1) ** -0.5)
+
+        return (teacher_outputs[0], special_attn_loss, ) + teacher_outputs[2:]
+
+def load_and_patch_model_with_RWKV6(model_path:str, attn_classes_path:str, attention_distillation_stage:int):
+    model_config = AutoConfig.from_pretrained(model_path)
+
+    # FIXME - hardcoded for now, but it'd be great if we could specify this in data somewhere per model type (or even analyze the weights to see)
+    # NOTE - when loading a custom Qwen2RWKV model we don't need to set model_config.attention_bias and model_config.attention_output_bias, because the model config contains it
+    if 'Qwen/Qwen' in model_path:
+        model_config.attention_bias = True
+        model_config.attention_output_bias = False
+
+    # replace attention classes
+    attn_classes_dict = locate(attn_classes_path)
+    attn_classes_dict_original_copy:dict = attn_classes_dict.copy()
+    assert isinstance(attn_classes_dict, dict), 'could not find attention classes dict at path provided'
+    if attention_distillation_stage == 1:
+        pass
+    elif attention_distillation_stage == 2:
+        # replace all attention classes with RWKV6AttentionDistillationWrapper that will be passed an invocation of the original attention class to wrap
+        for key in list(attn_classes_dict.keys()):
+            cls = attn_classes_dict[key]
+            attn_classes_dict[key] = lambda *args, **kwargs: RWKV6AttentionDistillationWrapper(cls(*args, **kwargs), model_config, attention_distillation_stage)
+    elif attention_distillation_stage >= 3:
+        for key in list(attn_classes_dict.keys()):
+            attn_classes_dict[key] = RWKV6Attention
+
+    model = AutoModel.from_pretrained(model_path, config=model_config)
+
+    # reset attention classes for upcoming teacher module's use
+    for key, value in attn_classes_dict_original_copy.items():
+        attn_classes_dict[key] = value
+
+    # patch model
+    if attention_distillation_stage in (1, 2):
+        # requires_grad_(False) on entire model, so it acts as teacher
+        model.requires_grad_(False)
+
+        if attention_distillation_stage == 1:
+            # monkeypatch conditionally executed student attention replacements (which do require grad)
+            for layer in model.model.layers:
+                layer.self_attn = RWKV6AttentionDistillationWrapper(layer.self_attn, model_config, attention_distillation_stage)
+
+        # student attention replacements do require grad in both stages 1 and 2
+        for layer in model.model.layers:
+            student_attn = layer.self_attn.student_attn
+            if attention_distillation_stage == 1:
+                student_attn.time_maa_x.requires_grad_(True)
+                student_attn.time_maa_r.requires_grad_(True)
+                student_attn.time_maa_k.requires_grad_(True)
+                #student_attn.time_maa_w.requires_grad_(True) # FIXME!!! we left this out!
+                student_attn.time_maa_w1.requires_grad_(True)
+                student_attn.time_maa_w2.requires_grad_(True)
+                student_attn.time_decay.requires_grad_(True)
+                student_attn.time_decay_w1.requires_grad_(True)
+                student_attn.time_decay_w2.requires_grad_(True)
+                # FIXME - wow we removed q, k here by accident and it.. helped??!?!
+            elif attention_distillation_stage == 2:
+                student_attn.requires_grad_(True)
+
+            # student_attn.requires_grad_(True)
+            # if attention_distillation_stage == 1:
+            #     # BUT, we don't want to train certain parameters during stage 1!
+            #     student_attn.q_proj.requires_grad_(False) # not training q,k was an odd choice but it somehow helped
+            #     student_attn.k_proj.requires_grad_(False)
+            #     student_attn.v_proj.requires_grad_(False)
+            #     student_attn.o_proj.requires_grad_(False)
+            #     #student_attn.time_maa_w.requires_grad_(False) # FIXME!!! we left this out by accident!
+
+            #     student_attn.time_maa_v.requires_grad_(False)
+            #     student_attn.ln_x.requires_grad_(False)
+
+    elif attention_distillation_stage >= 3:
+        if model_config.tie_word_embeddings:
+            # copy untied embeddings
+            model.get_output_embeddings().weight = nn.Parameter(model.get_input_embeddings().weight.clone())
+            # untie the embeddings in the config, too
+            model_config.tie_word_embeddings = False
+
+    return model
