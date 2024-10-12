@@ -146,7 +146,7 @@ def main():
 
     attention_distillation_stage = config.train.attention_distillation_stage
 
-    model = load_and_patch_model_with_RWKV6(config.model_path, config.model_path, config.attn_classes_path, attention_distillation_stage)
+    model = load_and_patch_model_with_RWKV6(config.model_path, config.attn_classes_path, attention_distillation_stage)
 
     if attention_distillation_stage in (1, 2):               
         TrainerType = AttentionDistillationTrainer
