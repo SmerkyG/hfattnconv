@@ -24,7 +24,7 @@ from typing import Any, Optional, Tuple
 
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from fla.ops.gla.chunk import chunk_gla, ChunkGLAFunction
 from pydoc import locate
@@ -323,7 +323,7 @@ def load_and_patch_model_with_RWKV6(model_path:str, attn_classes_path:str, atten
         for key in list(attn_classes_dict.keys()):
             attn_classes_dict[key] = RWKV6Attention
 
-    model = AutoModel.from_pretrained(model_path, config=model_config)
+    model = AutoModelForCausalLM.from_pretrained(model_path, config=model_config)
 
     # reset attention classes for upcoming teacher module's use
     for key, value in attn_classes_dict_original_copy.items():
