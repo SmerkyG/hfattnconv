@@ -1,3 +1,4 @@
+model_path: ./out1
 train:
   attention_distillation_stage: 2
   output_dir: out2
