@@ -181,7 +181,6 @@ def main():
         
         trainer.train()
 
-        delattr(model, 'attention_distillation_stage')
         if attention_distillation_stage == 2:
             # remove extra teacher attention modules so we can load this model normally in stage 3 and beyond
             for layer in model.model.layers:
