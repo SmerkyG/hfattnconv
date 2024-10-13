@@ -10,7 +10,7 @@ from configs import parse_cmdline_configs
 from dataclasses import dataclass, field
 from pydoc import locate
 
-from rwkv6attn import load_and_patch_model_with_RWKV6
+from rwkv6attn import RWKV6Attention, RWKV6AttentionDistillationWrapper
 
 @dataclass(kw_only=True)
 class Train_Config:
@@ -144,20 +144,106 @@ def main():
 
     training_args = config.train.training_args
 
+    model_config = AutoConfig.from_pretrained(config.model_path)
+
+    # FIXME - hardcoded for now, but it'd be great if we could specify this in data somewhere per model type (or even analyze the weights to see)
+    # NOTE - when loading a custom Qwen2RWKV model we don't need to set model_config.attention_bias and model_config.attention_output_bias, because the model config contains it
+    if 'Qwen/Qwen' in config.model_path:
+        model_config.attention_bias = True
+        model_config.attention_output_bias = False
+
     attention_distillation_stage = config.train.attention_distillation_stage
 
-    model = load_and_patch_model_with_RWKV6(config.model_path, config.attn_classes_path, attention_distillation_stage)
+    # replace attention classes
+    attn_classes_dict = locate(config.attn_classes_path)
+    attn_classes_dict_original_copy:dict = attn_classes_dict.copy()
+    assert isinstance(attn_classes_dict, dict), 'could not find attention classes dict at path provided'
+    if attention_distillation_stage == 1:
+        pass
+    elif attention_distillation_stage == 2:
+        # replace all attention classes with RWKV6AttentionDistillationWrapper that will be passed an invocation of the original attention class to wrap
+        for key in list(attn_classes_dict.keys()):
+            cls = attn_classes_dict[key]
+            attn_classes_dict[key] = lambda *args, **kwargs: RWKV6AttentionDistillationWrapper(cls(*args, **kwargs), model_config, attention_distillation_stage)
+    elif attention_distillation_stage >= 3:
+        for key in list(attn_classes_dict.keys()):
+            attn_classes_dict[key] = RWKV6Attention
 
-    if attention_distillation_stage in (1, 2):               
+    model = AutoModelForCausalLM.from_pretrained(config.model_path, config=model_config)
+
+    # reset attention classes for upcoming teacher module's use
+    for key, value in attn_classes_dict_original_copy.items():
+        attn_classes_dict[key] = value
+
+    # patch model
+    model.attention_distillation_stage = attention_distillation_stage
+    if attention_distillation_stage in (1, 2):
+        # requires_grad_(False) on entire model, so it acts as teacher
+        model.requires_grad_(False)
+
+        if attention_distillation_stage == 1:
+            # monkeypatch conditionally executed student attention replacements (which do require grad)
+            for layer in model.model.layers:
+                layer.self_attn = RWKV6AttentionDistillationWrapper(layer.self_attn, model_config, attention_distillation_stage)
+
+        # student attention replacements do require grad in both stages 1 and 2
+        for layer in model.model.layers:
+            student_attn = layer.self_attn.student_attn
+            if attention_distillation_stage == 1:
+                student_attn.time_maa_x.requires_grad_(True)
+                student_attn.time_maa_r.requires_grad_(True)
+                student_attn.time_maa_k.requires_grad_(True)
+                #student_attn.time_maa_w.requires_grad_(True) # FIXME!!! we left this out!
+                student_attn.time_maa_w1.requires_grad_(True)
+                student_attn.time_maa_w2.requires_grad_(True)
+                student_attn.time_decay.requires_grad_(True)
+                student_attn.time_decay_w1.requires_grad_(True)
+                student_attn.time_decay_w2.requires_grad_(True)
+                # FIXME - wow we removed q, k here by accident and it.. helped??!?!
+            elif attention_distillation_stage == 2:
+                student_attn.requires_grad_(True)
+
+            # student_attn.requires_grad_(True)
+            # if attention_distillation_stage == 1:
+            #     # BUT, we don't want to train certain parameters during stage 1!
+            #     student_attn.q_proj.requires_grad_(False) # not training q,k was an odd choice but it somehow helped
+            #     student_attn.k_proj.requires_grad_(False)
+            #     student_attn.v_proj.requires_grad_(False)
+            #     student_attn.o_proj.requires_grad_(False)
+            #     #student_attn.time_maa_w.requires_grad_(False) # FIXME!!! we left this out by accident!
+
+            #     student_attn.time_maa_v.requires_grad_(False)
+            #     student_attn.ln_x.requires_grad_(False)
+                
         TrainerType = AttentionDistillationTrainer
         trainer_kwargs = {}
+
     elif attention_distillation_stage == 3:
+        if model_config.tie_word_embeddings:
+            # copy untied embeddings
+            model.get_output_embeddings().weight = nn.Parameter(model.get_input_embeddings().weight.clone())
+            # untie the embeddings in the config, too
+            model_config.tie_word_embeddings = False
+
         # traditional distillation, so we need to load a second teacher model for inference
         TrainerType = DistillationTrainer
         trainer_kwargs = dict(teacher=AutoModelForCausalLM.from_pretrained(config.train.teacher_model_path))
+
+    elif attention_distillation_stage == 4:
+        if model_config.tie_word_embeddings:
+            # copy untied embeddings
+            model.get_output_embeddings().weight = nn.Parameter(model.get_input_embeddings().weight.clone())
+            # untie the embeddings in the config, too
+            model_config.tie_word_embeddings = False
+
+        TrainerType = Trainer
+        trainer_kwargs = {}
+
     else:
         TrainerType = Trainer
         trainer_kwargs = {}
+
+    # FIXME - patch model's _init_weights function
 
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
     train_dataset = load_dataset(config.train.train_dataset_path, split=config.train.train_dataset_split, streaming=True)
