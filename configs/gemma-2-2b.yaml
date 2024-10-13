@@ -1,0 +1,4 @@
+model_path: google/gemma-2-2b
+attn_classes_path: transformers.models.gemma2.modeling_gemma2.GEMMA2_ATTENTION_CLASSES
+train:
+  teacher_model_path: google/gemma-2-2b

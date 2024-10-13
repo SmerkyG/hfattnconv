@@ -26,7 +26,7 @@ class Train_Config:
 
 @dataclass(kw_only=True)
 class CLI_Config:
-    tokenizer_path: str
+    tokenizer_path: str = ''
     model_path: str
     attn_classes_path: str = 'transformers.models.qwen2.modeling_qwen2.QWEN2_ATTENTION_CLASSES' # 'transformers.models.llama.modeling_llama.LLAMA_ATTENTION_CLASSES' 
     seed: int = 1337
@@ -159,6 +159,8 @@ def main():
         TrainerType = Trainer
         trainer_kwargs = {}
 
+    if config.tokenizer_path == '':
+        config.tokenizer_path = config.model_path
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
     train_dataset = load_dataset(config.train.train_dataset_path, split=config.train.train_dataset_split, streaming=True)
 
