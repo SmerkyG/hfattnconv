@@ -1,7 +1,6 @@
 model_path: ./out2
 train:
   attention_distillation_stage: 3
-  teacher_model_path: Qwen/Qwen2.5-0.5B
   output_dir: out3
   sequence_length: 512
   train_dataset_path: robbiegwaldd/dclm-10B

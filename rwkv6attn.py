@@ -70,13 +70,13 @@ class RWKV6Attention(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = getattr(config, 'head_dim', self.hidden_size // self.num_heads)
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
+        if self.hidden_size % self.num_heads != 0:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
@@ -84,10 +84,11 @@ class RWKV6Attention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_output_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=getattr(config, 'attention_output_bias', config.attention_bias))
 
         n_layer = self.config.num_hidden_layers
-        n_embd = dim_att = self.hidden_size
+        n_embd = self.hidden_size
+        dim_att = self.num_heads * self.head_dim
         layer_id = self.layer_idx
 
         with torch.no_grad():
@@ -235,7 +236,7 @@ class RWKV6Attention(nn.Module):
             #attn_output = fla_chunk_simple_gla(query_states, key_states, value_states, decay_states_log.view(bsz, self.num_heads, q_len))[0]
             attn_output = fla_chunk_gla(query_states, key_states, value_states, decay_states_log)[0]
             attn_output = attn_output.transpose(1, 2).contiguous()
-            attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+            attn_output = attn_output.view(bsz, q_len, -1)
             attn_output = self.ln_x(attn_output)
             attn_output = self.o_proj(attn_output)
         else:
