@@ -2,6 +2,7 @@ import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import transformers.data
 from typing import Optional, Tuple, Any
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, PreTrainedModel
 from transformers.trainer_callback import TrainerCallback
@@ -175,7 +176,7 @@ def main():
             train_dataset = train_dataset,
             #eval_dataset = dataset['test'],
             tokenizer = tokenizer,
-            #data_collator = data_collator,
+            data_collator = transformers.data.default_data_collator,
             **trainer_kwargs
         )
         
