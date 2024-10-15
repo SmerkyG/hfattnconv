@@ -263,9 +263,10 @@ class RWKV6AttentionDistillationWrapper(nn.Module):
             student_params_dict = dict(self.student_attn.named_parameters())
             for n, p in self.teacher_attn.named_parameters():
                 if n in student_params_dict:
+                    rg_temp = student_params_dict[n].requires_grad
                     student_params_dict[n].requires_grad_(False)
                     student_params_dict[n].copy_(p)
-                    student_params_dict[n].requires_grad_(True)
+                    student_params_dict[n].requires_grad_(rg_temp)
 
     def forward(self, 
         # hidden_states: torch.Tensor,
