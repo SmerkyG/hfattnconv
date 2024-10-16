@@ -165,6 +165,11 @@ def main():
 
     train_dataset = train_dataset.map(lambda x: tokenize_all(x, tokenizer, config.train.sequence_length, 8), batched=True, remove_columns=train_dataset.column_names)
 
+    if config.train.attention_distillation_stage == 2:
+        train_dataset = train_dataset.skip(40_000_000)
+    if config.train.attention_distillation_stage == 3:
+        train_dataset = train_dataset.skip(40_000_000 + 40_000_000)
+        
     train_dataset = train_dataset.take(config.train.token_count)
 
     train_dataset = train_dataset.shuffle(seed=config.seed)
