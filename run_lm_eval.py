@@ -34,6 +34,21 @@ if errors != '':
     print(errors)
     exit()
 
+match config.precision:
+    case 32:
+        dtype = torch.float32
+    case '32':
+        dtype = torch.float32
+    case 16:
+        dtype = torch.float16
+    case '16':
+        dtype = torch.float16
+    case 'bf16':
+        dtype = torch.bfloat16
+    case _:
+        print("Bad precision type specified")
+        exit()
+
 # avoid 1000 huggingface warnings "huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...""
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -53,7 +68,7 @@ assert isinstance(attn_classes_dict, dict), 'could not find attention classes di
 for key in list(attn_classes_dict.keys()):
     attn_classes_dict[key] = RWKV6Attention
 
-model = AutoModelForCausalLM.from_pretrained(config.model_path, config=model_config)
+model = AutoModelForCausalLM.from_pretrained(config.model_path, config=model_config, torch_dtype=dtype, device_map='cuda')
 
 # UNNECESSARY because leave the config saying that they're tied, so it will treat them as tied even though they're both saved
 # re-tie embeddings
@@ -61,23 +76,8 @@ model = AutoModelForCausalLM.from_pretrained(config.model_path, config=model_con
 
 tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
 
-match config.precision:
-    case 32:
-        dtype = torch.float32
-    case '32':
-        dtype = torch.float32
-    case 16:
-        dtype = torch.float16
-    case '16':
-        dtype = torch.float16
-    case 'bf16':
-        dtype = torch.bfloat16
-    case _:
-        print("Bad precision type specified")
-        exit()
-
-device = 'cuda'
-model = model.to(device=device, dtype=dtype)
+#device = 'cuda'
+#model = model.to(device=device, dtype=dtype)
 model.eval()
 
 eval_tasks = config.tasks.split(',')
