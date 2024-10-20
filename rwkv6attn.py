@@ -344,16 +344,21 @@ def load_and_patch_model_with_RWKV6(model_path:str, attn_classes_path:str, atten
         for layer in model.model.layers:
             student_attn = layer.self_attn.student_attn
             if attention_distillation_stage == 1:
+                # set all parameters in the student to requires_grad=False first, because the new parameters that weren't in the teacher will out as requires_grad=True
+                student_attn.requires_grad_(False)
+
                 student_attn.time_maa_x.requires_grad_(True)
                 student_attn.time_maa_r.requires_grad_(True)
                 student_attn.time_maa_k.requires_grad_(True)
-                #student_attn.time_maa_w.requires_grad_(True) # FIXME!!! we left this out!
+                student_attn.time_maa_w.requires_grad_(True)
                 student_attn.time_maa_w1.requires_grad_(True)
                 student_attn.time_maa_w2.requires_grad_(True)
                 student_attn.time_decay.requires_grad_(True)
                 student_attn.time_decay_w1.requires_grad_(True)
                 student_attn.time_decay_w2.requires_grad_(True)
                 # FIXME - wow we removed q, k here by accident and it.. helped??!?!
+                #student_attn.q_proj.requires_grad_(True)
+                #student_attn.k_proj.requires_grad_(True)
             elif attention_distillation_stage == 2:
                 student_attn.requires_grad_(True)
 
