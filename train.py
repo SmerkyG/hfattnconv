@@ -146,10 +146,11 @@ def main():
     training_args = config.train.training_args
 
     attention_distillation_stage = config.train.attention_distillation_stage
+    assert attention_distillation_stage in (0,2,3)
 
     model = load_and_patch_model_with_RWKV6(config.model_path, config.attn_classes_path, attention_distillation_stage)
 
-    if attention_distillation_stage in (1, 2):               
+    if attention_distillation_stage == 2:
         TrainerType = AttentionDistillationTrainer
         trainer_kwargs = {}
     elif attention_distillation_stage == 3:
