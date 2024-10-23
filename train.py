@@ -92,7 +92,7 @@ class AttentionDistillationTrainer(Trainer):
         # remove the labels so that the model doesn't bother computing loss
         inputs.pop("labels")
         #inputs['return_dict'] = True
-        #inputs['output_attentions'] = True
+        inputs['output_attentions'] = True
         outputs = model(**inputs)
         distillation_loss = torch.stack(outputs.attentions, dim=0).mean()
         return (distillation_loss, outputs) if return_outputs else distillation_loss
