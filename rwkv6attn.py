@@ -268,8 +268,8 @@ class RWKV6AttentionDistillationWrapper(nn.Module):
         assert attention_distillation_stage in (1, 2)
         self.attention_distillation_stage = attention_distillation_stage
 
-        # copy in teacher's starting parameter values into student during stage 1
-        if attention_distillation_stage == 1:
+        # copy in teacher's starting parameter values into student during stage 2
+        if attention_distillation_stage == 2:
             student_params_dict = dict(self.student_attn.named_parameters())
             for n, p in self.teacher_attn.named_parameters():
                 if n in student_params_dict:
@@ -326,10 +326,11 @@ def load_and_patch_model_with_RWKV6(model_path:str, attn_classes_path:str, atten
     if attention_distillation_stage == 1:
         pass
     elif attention_distillation_stage == 2:
-        # replace all attention classes with RWKV6AttentionDistillationWrapper that will be passed an invocation of the original attention class to wrap
-        for key in list(attn_classes_dict.keys()):
-            cls = attn_classes_dict[key]
-            attn_classes_dict[key] = lambda *args, **kwargs: RWKV6AttentionDistillationWrapper(cls(*args, **kwargs), model_config, attention_distillation_stage)
+        pass
+        # # replace all attention classes with RWKV6AttentionDistillationWrapper that will be passed an invocation of the original attention class to wrap
+        # for key in list(attn_classes_dict.keys()):
+        #     cls = attn_classes_dict[key]
+        #     attn_classes_dict[key] = lambda *args, **kwargs: RWKV6AttentionDistillationWrapper(cls(*args, **kwargs), model_config, attention_distillation_stage)
     elif attention_distillation_stage >= 3:
         for key in list(attn_classes_dict.keys()):
             attn_classes_dict[key] = RWKV6Attention
@@ -345,7 +346,7 @@ def load_and_patch_model_with_RWKV6(model_path:str, attn_classes_path:str, atten
         # requires_grad_(False) on entire model, so it acts as teacher
         model.requires_grad_(False)
 
-        if attention_distillation_stage == 1:
+        if attention_distillation_stage == 2:
             # monkeypatch conditionally executed student attention replacements (which do require grad)
             for layer in model.model.layers:
                 layer.self_attn = RWKV6AttentionDistillationWrapper(layer.self_attn, model_config, attention_distillation_stage)
@@ -353,26 +354,26 @@ def load_and_patch_model_with_RWKV6(model_path:str, attn_classes_path:str, atten
         # student attention replacements do require grad in both stages 1 and 2
         for layer in model.model.layers:
             student_attn = layer.self_attn.student_attn
-            if attention_distillation_stage == 1:
-                # set all parameters in the student to requires_grad=False first, because the new parameters that weren't in the teacher will out as requires_grad=True
-                student_attn.requires_grad_(False)
+            # if attention_distillation_stage == 1:
+            #     # set all parameters in the student to requires_grad=False first, because the new parameters that weren't in the teacher will out as requires_grad=True
+            #     student_attn.requires_grad_(False)
 
-                student_attn.time_maa_x.requires_grad_(True)
-                student_attn.time_maa_r.requires_grad_(True)
-                student_attn.time_maa_k.requires_grad_(True)
-                student_attn.time_maa_w.requires_grad_(True)
-                student_attn.time_maa_w1.requires_grad_(True)
-                student_attn.time_maa_w2.requires_grad_(True)
-                student_attn.time_decay.requires_grad_(True)
-                student_attn.time_decay_w1.requires_grad_(True)
-                student_attn.time_decay_w2.requires_grad_(True)
-                student_attn.gate.requires_grad_(True)
-                #student_attn.ln_x.requires_grad_(True)
-                # FIXME - wow we removed q, k here by accident and it.. helped??!?! but when using gate and no ln_x it was better training q, k in stage 1
-                student_attn.q_proj.requires_grad_(True)
-                student_attn.k_proj.requires_grad_(True)
-            elif attention_distillation_stage == 2:
-                student_attn.requires_grad_(True)
+            #     student_attn.time_maa_x.requires_grad_(True)
+            #     student_attn.time_maa_r.requires_grad_(True)
+            #     student_attn.time_maa_k.requires_grad_(True)
+            #     student_attn.time_maa_w.requires_grad_(True)
+            #     student_attn.time_maa_w1.requires_grad_(True)
+            #     student_attn.time_maa_w2.requires_grad_(True)
+            #     student_attn.time_decay.requires_grad_(True)
+            #     student_attn.time_decay_w1.requires_grad_(True)
+            #     student_attn.time_decay_w2.requires_grad_(True)
+            #     student_attn.gate.requires_grad_(True)
+            #     #student_attn.ln_x.requires_grad_(True)
+            #     # FIXME - wow we removed q, k here by accident and it.. helped??!?! but when using gate and no ln_x it was better training q, k in stage 1
+            #     student_attn.q_proj.requires_grad_(True)
+            #     student_attn.k_proj.requires_grad_(True)
+            # elif attention_distillation_stage == 2:
+            student_attn.requires_grad_(True)
 
             # student_attn.requires_grad_(True)
             # if attention_distillation_stage == 1:
