@@ -20,6 +20,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Any, Optional, Tuple
 
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
@@ -86,6 +87,12 @@ class RWKV6Attention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=getattr(config, 'attention_output_bias', config.attention_bias))
 
+        self.gate = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
+        # start gate out with no effect
+        nn.init.zeros_(self.gate.weight)
+        with torch.no_grad():
+            self.gate.bias[:] = 1.227
+
         n_layer = self.config.num_hidden_layers
         n_embd = self.hidden_size
         dim_att = self.num_heads * self.head_dim
@@ -110,9 +117,10 @@ class RWKV6Attention(nn.Module):
             self.time_maa_k = nn.Parameter(torch.zeros_like(ddd))
             self.time_maa_v = nn.Parameter(torch.zeros_like(ddd))
             self.time_maa_w = nn.Parameter(torch.zeros_like(ddd))
+            self.time_maa_g = nn.Parameter(torch.zeros_like(ddd))
 
             D_MIX_LORA = 32 if n_embd < 4096 else 64
-            self.time_maa_w2 = nn.Parameter(torch.zeros(4, D_MIX_LORA, n_embd).uniform_(-0.01, 0.01))
+            self.time_maa_w2 = nn.Parameter(torch.zeros(5, D_MIX_LORA, n_embd).uniform_(-0.01, 0.01))
             self.time_maa_w1 = nn.Parameter(torch.zeros(n_embd, D_MIX_LORA*self.time_maa_w2.size(0)))
 
             # # per-head RWKV-6
@@ -141,17 +149,17 @@ class RWKV6Attention(nn.Module):
             #     tmp[n] = ratio_0_to_1 * (1 - (n / (dim_att - 1))) + zigzag
             # self.time_faaaa = nn.Parameter(tmp.reshape(self.n_head, self.head_size))
 
-        self.ln_x = nn.LayerNorm(dim_att)
+        #self.ln_x = nn.LayerNorm(dim_att)
 
-        # init weights for ln_x
-        p = self.ln_x.weight
-        requires_grad_temp = p.requires_grad
-        p.requires_grad_(False)
-        layer_scale = ((1+layer_idx) / n_layer) ** 0.7
-        #print('.ln_x.weight layer', layer_idx, "scale", layer_scale)
-        p *= 0.0
-        p += layer_scale
-        p.requires_grad = requires_grad_temp
+        # # init weights for ln_x
+        # p = self.ln_x.weight
+        # requires_grad_temp = p.requires_grad
+        # p.requires_grad_(False)
+        # layer_scale = ((1+layer_idx) / n_layer) ** 0.7
+        # #print('.ln_x.weight layer', layer_idx, "scale", layer_scale)
+        # p *= 0.0
+        # p += layer_scale
+        # p.requires_grad = requires_grad_temp
 
     def segsum(self, w_log): # B H L 1
         w_log_cumsum = torch.cumsum(w_log, dim=-2) # (B, H, L, 1)
@@ -179,16 +187,18 @@ class RWKV6Attention(nn.Module):
         xxx = torch.tanh(xxx @ self.time_maa_w1).view(bsz*q_len, self.time_maa_w2.size(0), -1).transpose(0, 1)
         xxx = torch.bmm(xxx, self.time_maa_w2).view(self.time_maa_w2.size(0), bsz, q_len, hidden_dim)
 
-        mr, mk, mv, mw = xxx.unbind(dim=0)
+        mr, mk, mv, mw, mg = xxx.unbind(dim=0)
         xr = x + dxprev * (self.time_maa_r + mr)
         xk = x + dxprev * (self.time_maa_k + mk)
         xv = x + dxprev * (self.time_maa_v + mv)
         xw = x + dxprev * (self.time_maa_w + mw)
+        xg = x + dxprev * (self.time_maa_g + mg)
 
         query_states = self.q_proj(xr)
         key_states = self.k_proj(xk)
         value_states = self.v_proj(xv)
         decay_states = (self.time_decay + torch.tanh(xw @ self.time_decay_w1) @ self.time_decay_w2).to(query_states.dtype)
+        g = F.silu(self.gate(xg))
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -237,8 +247,8 @@ class RWKV6Attention(nn.Module):
             attn_output = fla_chunk_gla(query_states, key_states, value_states, decay_states_log)[0]
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.view(bsz, q_len, -1)
-            attn_output = self.ln_x(attn_output)
-            attn_output = self.o_proj(attn_output)
+            #attn_output = self.ln_x(attn_output)
+            attn_output = self.o_proj(attn_output * g)
         else:
             attn_weights = (query_states * (key_states.size(-1) ** -0.5)) @ key_states.mT
 
@@ -279,24 +289,24 @@ class RWKV6AttentionDistillationWrapper(nn.Module):
         *args,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if self.attention_distillation_stage == 2:
-            # we don't need these for stage 2, only stage 1
-            kwargs['output_attentions'] = False
+        #if self.attention_distillation_stage == 2:
+        # we don't need these for stage 2, only stage 1
+        kwargs['output_attentions'] = False
 
         # NOTE - instead of returning attentions here we return a special attention loss
         student_outputs = self.student_attn(*args, **kwargs)
         teacher_outputs = self.teacher_attn(*args, **kwargs)
         assert self.attention_distillation_stage in (1,2)
-        if self.attention_distillation_stage == 1:
-            # a) special attention loss is the matrix_norm of the student and teacher attentions
-            student_attentions = student_outputs[1]
-            teacher_attentions = teacher_outputs[1]
-            special_attn_loss = torch.linalg.matrix_norm(teacher_attentions - student_attentions).mean() / teacher_attentions[0].size(-1)
-        else: # self.attention_distillation_stage == 2:
-            # b) special attention loss is the vector norm of the difference between the student and teacher attn outputs
-            student_hidden_states = student_outputs[0]
-            teacher_hidden_states = teacher_outputs[0]
-            special_attn_loss = torch.linalg.vector_norm(teacher_hidden_states - student_hidden_states, dim=-1).mean() * (teacher_hidden_states[0].size(-1) ** -0.5)
+        #if self.attention_distillation_stage == 1:
+        #    # a) special attention loss is the matrix_norm of the student and teacher attentions
+        #    student_attentions = student_outputs[1]
+        #    teacher_attentions = teacher_outputs[1]
+        #   special_attn_loss = torch.linalg.matrix_norm(teacher_attentions - student_attentions).mean() / teacher_attentions[0].size(-1)
+        #else: # self.attention_distillation_stage == 2:
+        # b) special attention loss is the vector norm of the difference between the student and teacher attn outputs
+        student_hidden_states = student_outputs[0]
+        teacher_hidden_states = teacher_outputs[0]
+        special_attn_loss = torch.linalg.vector_norm(teacher_hidden_states - student_hidden_states, dim=-1).mean() * (teacher_hidden_states[0].size(-1) ** -0.5)
 
         return (teacher_outputs[0], special_attn_loss, ) + teacher_outputs[2:]
 
@@ -356,9 +366,11 @@ def load_and_patch_model_with_RWKV6(model_path:str, attn_classes_path:str, atten
                 student_attn.time_decay.requires_grad_(True)
                 student_attn.time_decay_w1.requires_grad_(True)
                 student_attn.time_decay_w2.requires_grad_(True)
-                # FIXME - wow we removed q, k here by accident and it.. helped??!?!
-                #student_attn.q_proj.requires_grad_(True)
-                #student_attn.k_proj.requires_grad_(True)
+                student_attn.gate.requires_grad_(True)
+                #student_attn.ln_x.requires_grad_(True)
+                # FIXME - wow we removed q, k here by accident and it.. helped??!?! but when using gate and no ln_x it was better training q, k in stage 1
+                student_attn.q_proj.requires_grad_(True)
+                student_attn.k_proj.requires_grad_(True)
             elif attention_distillation_stage == 2:
                 student_attn.requires_grad_(True)
 
