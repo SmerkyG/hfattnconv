@@ -48,7 +48,7 @@ if wind_cuda:
             torch.ops.wind.backward(w,q,k,v,a,b, dy,s,dsT, dw,dq,dk,dv,da,db,ds0)
             return dw,dq,dk,dv,da,db
 
-    def RUN_CUDA_RWKV7g(q,w,k,v,a,b):
+    def RUN_CUDA_RWKV7g(q,w,k,v,a,b) -> torch.Tensor:
         B,T,HC = q.shape
         q,w,k,v,a,b = [i.view(B,T,HC//HEAD_SIZE,HEAD_SIZE) for i in [q,w,k,v,a,b]]
         return WindRWKV7.apply(w,q,k,v,a,b).view(B,T,HC)
@@ -82,7 +82,7 @@ elif fast_cuda:
             torch.ops.wind_backstepping.backward(w,q,k,v,z,b, dy,s,sa, dw,dq,dk,dv,dz,db)
             return dw,dq,dk,dv,dz,db
 
-    def RUN_CUDA_RWKV7g(q,w,k,v,a,b):
+    def RUN_CUDA_RWKV7g(q,w,k,v,a,b) -> torch.Tensor:
         B,T,HC = q.shape
         q,w,k,v,a,b = [i.view(B,T,HC//64,64) for i in [q,w,k,v,a,b]]
         return WindBackstepping.apply(w,q,k,v,a,b).view(B,T,HC)
@@ -140,7 +140,7 @@ else:
                 del sss
                 del zzz
                 return (gr, gw, gk, gv, ga, gb)
-    def RUN_CUDA_RWKV7g(r, w, k, v, a, b):
+    def RUN_CUDA_RWKV7g(r, w, k, v, a, b) -> torch.Tensor:
         return WKV_7g.apply(r, w, k, v, a, b)      
 
 class RWKV7Attention(nn.Module):
@@ -259,10 +259,13 @@ class RWKV7Attention(nn.Module):
     ):
         x = hidden_states
 
+        input_seq_len = x.size(1)
+        if input_seq_len % 16 != 0:
+            x = F.pad(x, (0, 0, 0, 16 - input_seq_len%16))
         B, T, C = x.size()
         H = self.num_heads
 
-        dxprev = torch.nn.functional.pad(x, (0, 0, 1, -1)) - x
+        dxprev = F.pad(x, (0, 0, 1, -1)) - x
 
         xxx = x + dxprev * self.time_maa_x
         xxx = torch.tanh(xxx @ self.time_maa_w1).view(B*T, 4, -1).transpose(0, 1)
@@ -318,10 +321,14 @@ class RWKV7Attention(nn.Module):
         #     v = v.to(target_dtype)
 
         x = RUN_CUDA_RWKV7g(r.bfloat16(), w.bfloat16(), k.bfloat16(), v.bfloat16(), -kk.bfloat16(), (kk*a).bfloat16())
+
         #x = self.ln_x(x.view(B * T, C)).view(B, T, C)
 
         x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.time_faaaa).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
         x = self.o_proj(x * g)
+
+        if input_seq_len != T:
+            x = x[:, :input_seq_len]
 
         return x, None, past_key_value
 

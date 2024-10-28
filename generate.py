@@ -10,18 +10,17 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Traine
 from configs import parse_cmdline_configs
 from pydoc import locate
 
-from rwkv6attn import RWKV6Attention
-
 from lm_eval import evaluator
 from lm_eval.models.huggingface import HFLM
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 @dataclass
 class CLI_Config:
     tokenizer_path: str
     model_path: str
+    attn_path: str = 'rwkv6attn.RWKV6Attention'
     prompt:str = "Hey, are you conscious? Can you talk to me?"
     max_len:int = 30
     attempts:int = 3
@@ -65,10 +64,12 @@ if config.model_path.startswith('.'):
         model_config.attention_output_bias = False
     
     # replace attention classes
+    ReplacementSelfAttentionType = locate(config.attn_path)
+    assert isinstance(ReplacementSelfAttentionType, Callable)
     attn_classes_dict = locate(config.attn_classes_path)
     assert isinstance(attn_classes_dict, dict), 'could not find attention classes dict at path provided'
     for key in list(attn_classes_dict.keys()):
-        attn_classes_dict[key] = RWKV6Attention
+        attn_classes_dict[key] = ReplacementSelfAttentionType
 
 model = AutoModelForCausalLM.from_pretrained(config.model_path, config=model_config, torch_dtype=dtype, device_map='cuda')
 
