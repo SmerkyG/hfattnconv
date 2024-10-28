@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers.data
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Callable
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, PreTrainedModel
 from transformers.trainer_callback import TrainerCallback
 from datasets import load_dataset
@@ -11,7 +11,7 @@ from configs import parse_cmdline_configs
 from dataclasses import dataclass, field
 from pydoc import locate
 
-from rwkv6attn import load_and_patch_model_with_RWKV6
+from rwkv6attn import load_and_patch_model_with_attention_replacement
 
 @dataclass(kw_only=True)
 class Train_Config:
@@ -29,6 +29,7 @@ class Train_Config:
 class CLI_Config:
     tokenizer_path: str
     model_path: str
+    attn_path: str = 'rwkv6attn.RWKV6Attention'
     attn_classes_path: str = 'transformers.models.qwen2.modeling_qwen2.QWEN2_ATTENTION_CLASSES' # 'transformers.models.llama.modeling_llama.LLAMA_ATTENTION_CLASSES' 
     seed: int = 1337
     train: Train_Config = field(default_factory=lambda: Train_Config())
@@ -148,7 +149,10 @@ def main():
     attention_distillation_stage = config.train.attention_distillation_stage
     assert attention_distillation_stage in (0,2,3)
 
-    model = load_and_patch_model_with_RWKV6(config.model_path, config.attn_classes_path, attention_distillation_stage)
+    ReplacementSelfAttnType = locate(config.attn_path)
+    assert isinstance(ReplacementSelfAttnType, Callable)
+
+    model = load_and_patch_model_with_attention_replacement(config.model_path, config.attn_classes_path, ReplacementSelfAttnType, attention_distillation_stage)
 
     if attention_distillation_stage == 2:
         TrainerType = AttentionDistillationTrainer

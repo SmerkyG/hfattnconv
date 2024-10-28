@@ -21,7 +21,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Callable
 
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 
@@ -220,11 +220,11 @@ class RWKV6Attention(nn.Module):
 
         return attn_output, attn_weights, past_key_value
 
-class RWKV6AttentionDistillationWrapper(nn.Module):
-    def __init__(self, original_self_attn:nn.Module, model_config:Any, attention_distillation_stage:int):
+class AttentionDistillationWrapper(nn.Module):
+    def __init__(self, original_self_attn:nn.Module, ReplacementSelfAttentionType:Callable, model_config:Any, attention_distillation_stage:int):
         super().__init__()
         self.teacher_attn = original_self_attn
-        self.student_attn = RWKV6Attention(model_config, original_self_attn.layer_idx)
+        self.student_attn = ReplacementSelfAttentionType(model_config, original_self_attn.layer_idx)
         assert attention_distillation_stage == 2
         self.attention_distillation_stage = attention_distillation_stage
 
@@ -263,7 +263,7 @@ class RWKV6AttentionDistillationWrapper(nn.Module):
 
         return (teacher_outputs[0], special_attn_loss, ) + teacher_outputs[2:]
 
-def load_and_patch_model_with_RWKV6(model_path:str, attn_classes_path:str, attention_distillation_stage:int):
+def load_and_patch_model_with_attention_replacement(model_path:str, attn_classes_path:str, ReplacementSelfAttentionType:Callable, attention_distillation_stage:int):
     model_config = AutoConfig.from_pretrained(model_path)
 
     # FIXME - hardcoded for now, but it'd be great if we could specify this in data somewhere per model type (or even analyze the weights to see)
@@ -278,7 +278,7 @@ def load_and_patch_model_with_RWKV6(model_path:str, attn_classes_path:str, atten
     assert isinstance(attn_classes_dict, dict), 'could not find attention classes dict at path provided'
     if attention_distillation_stage >= 3:
         for key in list(attn_classes_dict.keys()):
-            attn_classes_dict[key] = RWKV6Attention
+            attn_classes_dict[key] = ReplacementSelfAttentionType
 
     model = AutoModelForCausalLM.from_pretrained(model_path, config=model_config)
 
@@ -293,7 +293,7 @@ def load_and_patch_model_with_RWKV6(model_path:str, attn_classes_path:str, atten
 
         # monkeypatch conditionally executed student attention replacements (which do require grad)
         for layer in model.model.layers:
-            layer.self_attn = RWKV6AttentionDistillationWrapper(layer.self_attn, model_config, attention_distillation_stage)
+            layer.self_attn = AttentionDistillationWrapper(layer.self_attn, ReplacementSelfAttentionType, model_config, attention_distillation_stage)
 
         # student attention replacements do require grad in both stages 1 and 2
         for layer in model.model.layers:
