@@ -153,24 +153,27 @@ def typecheck(path : str, obj : typing.Any, required_type : type = typing.Any, p
                     required_type = sub_required_type
 
                 sig = inspect.signature(required_type.__init__)
-                for k in obj.keys():
-                    if k != '__type__' and k not in sig.parameters.keys():
-                        return f'Disallowed config entry `{path}.{k}` - No such parameter `{k}` in {required_type}\n'
-                    
-                # traverse all subelements recursively
-                for k, param in sig.parameters.items():
-                    if k == 'self':
-                        continue
-                    if k in obj.keys():
-                        rt = param.annotation
-                        if rt == inspect.Parameter.empty:
-                            rt = typing.Any
-                        errors += typecheck(k if path == '' else path + '.' + k, obj[k], rt, obj, k)
-                    elif param.default == inspect.Parameter.empty:               
-                        return f'Required parameter `{path}.{k}` missing in {required_type}\n'
-                    else:
-                        # add default value into config
-                        obj[k] = param.default
+                required_type_origin = typing.get_origin(required_type)
+                if required_type_origin != typing.Union:
+                    # FIXME - for now, allow anything in a Union through (really need to check each subtype)
+                    for k in obj.keys():
+                        if k != '__type__' and k not in sig.parameters.keys():
+                            return f'Disallowed config entry `{path}.{k}` - No such parameter `{k}` in {required_type}\n'
+                        
+                    # traverse all subelements recursively
+                    for k, param in sig.parameters.items():
+                        if k == 'self':
+                            continue
+                        if k in obj.keys():
+                            rt = param.annotation
+                            if rt == inspect.Parameter.empty:
+                                rt = typing.Any
+                            errors += typecheck(k if path == '' else path + '.' + k, obj[k], rt, obj, k)
+                        elif param.default == inspect.Parameter.empty:               
+                            return f'Required parameter `{path}.{k}` missing in {required_type}\n'
+                        else:
+                            # add default value into config
+                            obj[k] = param.default
 
         elif required_type != typing.Any and not isinstance(obj, required_type) and not (required_type == float and isinstance(obj, int)):
             if required_type == str and not isinstance(obj, str):
