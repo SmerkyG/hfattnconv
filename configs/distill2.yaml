@@ -1,10 +1,10 @@
-model_path: ./out1
+#model_path: ./out1
 train:
   attention_distillation_stage: 2
   output_dir: out2
   sequence_length: 512
   train_dataset_path: robbiegwaldd/dclm-10B
-  token_count: 40000000
+  token_count: 100000000
   training_args:
     output_dir: out
     bf16: True
