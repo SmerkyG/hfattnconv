@@ -25,6 +25,7 @@ class CLI_Config:
     tasks: str = 'lambada_openai' # arc_challenge, arc_easy, headqa, openbookqa, hellaswag, winogrande, piqa, record, copa, storycloze_2016
     bsz: int|str = 'auto'
     precision: int | str = 'bf16'
+    num_fewshot: int = 0
     attn_classes_path: str = 'transformers.models.qwen2.modeling_qwen2.QWEN2_ATTENTION_CLASSES' # 'transformers.models.llama.modeling_llama.LLAMA_ATTENTION_CLASSES' 
     seed: int | None = None
     train:Any = None
@@ -92,12 +93,12 @@ with torch.no_grad():
 	        model=adapter,
 	        tasks=eval_tasks,
 	        #provide_description=False,
-	        num_fewshot=0,
+	        num_fewshot=config.num_fewshot,
 	        limit=None,
 	        bootstrap_iters=10000,
 	        numpy_random_seed = config.seed,
 	        torch_random_seed = config.seed,
-	        # fewshot_random_seed = config.seed, # FIXME - needed in next version of lm_eval
+	        fewshot_random_seed = config.seed,
 	    )
 
 print(results['results'])
