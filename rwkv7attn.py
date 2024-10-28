@@ -244,7 +244,7 @@ class RWKV7Attention(nn.Module):
             self.mk_w2 = nn.Parameter(torch.zeros(D_MK_LORA, dim_att).uniform_(-0.01, 0.01)) #nn.Parameter(ortho_init(torch.zeros(D_MK_LORA, dim_att), 0.1))
             self.time_misc_k = nn.Parameter(torch.zeros(1,1,n_embd))
 
-            #self.ln_x = nn.GroupNorm(self.num_heads, dim_att, eps=64e-5)
+            self.ln_x = nn.GroupNorm(self.num_heads, dim_att, eps=64e-5)
 
     def forward(
         self,
@@ -322,7 +322,7 @@ class RWKV7Attention(nn.Module):
 
         x = RUN_CUDA_RWKV7g(r.bfloat16(), w.bfloat16(), k.bfloat16(), v.bfloat16(), -kk.bfloat16(), (kk*a).bfloat16())
 
-        #x = self.ln_x(x.view(B * T, C)).view(B, T, C)
+        x = self.ln_x(x.view(B * T, C)).view(B, T, C)
 
         x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.time_faaaa).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
         x = self.o_proj(x * g)
