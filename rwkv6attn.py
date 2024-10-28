@@ -181,7 +181,7 @@ class RWKV6Attention(nn.Module):
         dropout_rate = 0.0 if not self.training else self.attention_dropout
 
         decay_states_log = -decay_states.float().exp()
-        decay_states_log = decay_states_log.clamp(-5) # FIXME - is this necessary?
+        #decay_states_log = decay_states_log.clamp(-5) # FIXME - is this necessary?
         key_states = (key_states * (1 - decay_states_log.exp())).to(key_states.dtype)
 
         query_states = query_states.to(value_states.dtype)
