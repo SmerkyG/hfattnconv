@@ -168,7 +168,7 @@ class RWKV6Attention(nn.Module):
         key_states = self.k_proj(xk)
         value_states = self.v_proj(xv)
         decay_states = (self.time_decay + torch.tanh(xw @ self.time_decay_w1) @ self.time_decay_w2).to(query_states.dtype)
-        g = F.silu(self.gate(xg))
+        gate_states = F.silu(self.gate(xg))
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -216,7 +216,7 @@ class RWKV6Attention(nn.Module):
         attn_output = fla_chunk_gla(query_states, key_states, value_states, decay_states_log)[0]
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, -1)
-        attn_output = self.o_proj(attn_output * g)
+        attn_output = self.o_proj(attn_output * gate_states)
 
         return attn_output, attn_weights, past_key_value
 

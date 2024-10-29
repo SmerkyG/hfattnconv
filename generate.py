@@ -1,5 +1,4 @@
 import sys, os
-import transformers # just for a bugfix for 0.4.2 of lm_eval
 
 import torch
 torch.backends.cudnn.benchmark = True
@@ -9,9 +8,6 @@ torch.backends.cuda.matmul.allow_tf32 = True
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 from configs import parse_cmdline_configs
 from pydoc import locate
-
-from lm_eval import evaluator
-from lm_eval.models.huggingface import HFLM
 
 from dataclasses import dataclass
 from typing import Any, Callable
