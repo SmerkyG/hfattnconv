@@ -186,17 +186,22 @@ class RWKV7Attention(nn.Module):
                 ddd[0, 0, i] = i / n_embd
 
             # initialization comes from fitting my RWKV-6 7B runs
-            # merging r&g w&a to save params
             self.time_maa_x = nn.Parameter(1.0 - torch.pow(ddd, 0.6 * ratio_1_to_almost0 ** 0.9))
-            self.time_maa_rg = nn.Parameter(torch.zeros_like(ddd)) #nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
-            self.time_maa_wa = nn.Parameter(torch.zeros_like(ddd)) #nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
+            self.time_maa_r = nn.Parameter(torch.zeros_like(ddd)) #nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+            self.time_maa_w = nn.Parameter(torch.zeros_like(ddd)) #nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
             self.time_maa_k = nn.Parameter(torch.zeros_like(ddd)) #nn.Parameter(1.0 - (torch.pow(ddd, 0.9 * ratio_1_to_almost0) + 0.4 * ratio_0_to_1))
             self.time_maa_v = nn.Parameter(torch.zeros_like(ddd)) #nn.Parameter(1.0 - (torch.pow(ddd, 0.4 * ratio_1_to_almost0) + 0.6 * ratio_0_to_1))
+            self.time_maa_g = nn.Parameter(torch.zeros_like(ddd)) #nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+            self.time_maa_a = nn.Parameter(torch.zeros_like(ddd)) #nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
 
             decay_speed = torch.ones(dim_att)
             for n in range(dim_att):
                 decay_speed[n] = -7 + 5 * (n / (dim_att - 1)) ** (0.85 + 1.0 * ratio_0_to_1 ** 0.5)
             self.time_decay = nn.Parameter(decay_speed.reshape(1,1,dim_att) + 0.5) # !!! 0.5 comes from F.softplus !!!
+            # decay_speed = torch.ones(dim_att)
+            # for n in range(dim_att):
+            #     decay_speed[n] = -6 + 5 * (n / (dim_att - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
+            # self.time_decay = nn.Parameter(decay_speed.reshape(1,1,dim_att))
 
             self.time_faaaa = nn.Parameter(torch.zeros(1,1,self.num_heads,self.head_dim))
             self.time_aaaaa = nn.Parameter(torch.zeros(1,1,dim_att))
@@ -216,18 +221,18 @@ class RWKV7Attention(nn.Module):
                     return x
 
             D_MIX_LORA = 32
-            self.time_maa_w1 = nn.Parameter(torch.zeros(n_embd, D_MIX_LORA*4))
-            self.time_maa_w2 = nn.Parameter(torch.zeros(4, D_MIX_LORA, n_embd).uniform_(-0.01, 0.01)) #nn.Parameter(ortho_init(torch.zeros(4, D_MIX_LORA, n_embd), 0.1))
+            self.time_maa_w1 = nn.Parameter(torch.zeros(n_embd, D_MIX_LORA*6))
+            self.time_maa_w2 = nn.Parameter(torch.zeros(6, D_MIX_LORA, n_embd).uniform_(-0.01, 0.01)) #nn.Parameter(ortho_init(torch.zeros(4, D_MIX_LORA, n_embd), 0.1))
 
             D_DECAY_LORA = 64 if n_embd < 4096 else 128
             self.time_decay_w1 = nn.Parameter(torch.zeros(n_embd, D_DECAY_LORA))
             self.time_decay_w2 = nn.Parameter(torch.zeros(D_DECAY_LORA, dim_att).uniform_(-0.01, 0.01))# nn.Parameter(ortho_init(torch.zeros(D_DECAY_LORA, dim_att), 0.1))
 
-            D_AAA_LORA = 16
+            D_AAA_LORA = 64
             self.time_aaa_w1 = nn.Parameter(torch.zeros(n_embd, D_AAA_LORA))
             self.time_aaa_w2 = nn.Parameter(torch.zeros(D_AAA_LORA, dim_att).uniform_(-0.01, 0.01)) #nn.Parameter(ortho_init(torch.zeros(D_AAA_LORA, dim_att), 0.1))
 
-            D_KKK_LORA = 16
+            D_KKK_LORA = 64
             self.time_kkk_w1 = nn.Parameter(torch.zeros(n_embd, D_KKK_LORA))
             self.time_kkk_w2 = nn.Parameter(torch.zeros(D_KKK_LORA, dim_att).uniform_(-0.01, 0.01)) #nn.Parameter(ortho_init(torch.zeros(D_KKK_LORA, dim_att), 0.1))
 
@@ -268,21 +273,26 @@ class RWKV7Attention(nn.Module):
         dxprev = F.pad(x, (0, 0, 1, -1)) - x
 
         xxx = x + dxprev * self.time_maa_x
-        xxx = torch.tanh(xxx @ self.time_maa_w1).view(B*T, 4, -1).transpose(0, 1)
-        xxx = torch.bmm(xxx, self.time_maa_w2).view(4, B, T, -1)
-        mrg, mwa, mk, mv = xxx.unbind(dim=0)
+        xxx = torch.tanh(xxx @ self.time_maa_w1).view(B*T, 6, -1).transpose(0, 1)
+        xxx = torch.bmm(xxx, self.time_maa_w2).view(6, B, T, -1)
+        mr, mw, mk, mv, mg, ma = xxx.unbind(dim=0)
 
-        xrg = x + dxprev * (self.time_maa_rg + mrg)
-        xwa = x + dxprev * (self.time_maa_wa + mwa)
+        xr = x + dxprev * (self.time_maa_r + mr)
+        xw = x + dxprev * (self.time_maa_w + mw)
         xk = x + dxprev * (self.time_maa_k + mk)
         xv = x + dxprev * (self.time_maa_v + mv)
+        xg = x + dxprev * (self.time_maa_g + mg)
+        xa = x + dxprev * (self.time_maa_a + ma)
 
-        r = self.q_proj(xrg)
-        w = -F.softplus(-(self.time_decay + torch.tanh(xwa @ self.time_decay_w1) @ self.time_decay_w2)) - 0.5
-        #decay_states = (self.time_decay + torch.tanh(xwa @ self.time_decay_w1) @ self.time_decay_w2).to(q.dtype)
+        r = self.q_proj(xr)
+        log_neglog_w = 0 - F.softplus(-(self.time_decay + torch.tanh(xw @ self.time_decay_w1) @ self.time_decay_w2)) 
+        #log_neglog_w = (self.time_decay + torch.tanh(xwa @ self.time_decay_w1) @ self.time_decay_w2) #.to(q.dtype)
+        #log_w = -log_neglog_w.float().exp()
+        #log_w = log_w.clamp(-5) # FIXME - is this necessary?
+
         k = self.k_proj(xk)
         v = self.v_proj(xv)
-        g = torch.tanh(xrg @ self.gate_w1) @ self.gate_w2
+        g = torch.sigmoid(torch.tanh(xg @ self.gate_w1) @ self.gate_w2)
 
         # repeat k/v heads if n_kv_heads < n_heads
         k = k.view(B, T, 1, -1, self.head_dim).expand(-1, -1, self.num_key_value_groups, -1, -1).reshape(B, T, -1)
@@ -290,12 +300,18 @@ class RWKV7Attention(nn.Module):
 
         kk = k + torch.tanh(xk @ self.time_kkk_w1) @ self.time_kkk_w2
         kk = F.normalize(kk.view(B,T,H,-1), dim=-1, p=2.0).view(B,T,C)
-        a = torch.sigmoid( self.time_aaaaa + (xwa @ self.time_aaa_w1) @ self.time_aaa_w2 )
+        #k = kk
+        a = torch.sigmoid( self.time_aaaaa + (xa @ self.time_aaa_w1) @ self.time_aaa_w2 )
+        #a = 0.0 * a + 1.0
 
-        ma = torch.sigmoid(self.time_misc_a + (xwa @ self.ma_w1) @ self.ma_w2)
+        ma = torch.sigmoid(self.time_misc_a + (xa @ self.ma_w1) @ self.ma_w2)
         k = k * ma + k*a * (1 - ma)
+        #k = k * a
         mk = torch.sigmoid(self.time_misc_k + (xk @ self.mk_w1) @ self.mk_w2)
-        k = k * torch.clamp(w*mk, max=0).exp()
+        k = k * torch.clamp(log_neglog_w*mk, max=0).exp()
+        #removed = 1.0 - log_w.exp()
+        #k = (k * ((1 + a) * removed)).to(r.dtype)
+        #k = (k * removed).to(r.dtype)
 
         # # In PEFT, usually we cast the layer norms in float32 for training stability reasons
         # # therefore the input hidden states gets silently casted in float32. Hence, we need
@@ -320,7 +336,7 @@ class RWKV7Attention(nn.Module):
         #     k = k.to(target_dtype)
         #     v = v.to(target_dtype)
 
-        x = RUN_CUDA_RWKV7g(r.bfloat16(), w.bfloat16(), k.bfloat16(), v.bfloat16(), -kk.bfloat16(), (kk*a).bfloat16())
+        x = RUN_CUDA_RWKV7g(r.bfloat16(), log_neglog_w.bfloat16(), k.bfloat16(), v.bfloat16(), -kk.bfloat16(), (kk*a).bfloat16())
 
         x = self.ln_x(x.view(B * T, C)).view(B, T, C)
 
