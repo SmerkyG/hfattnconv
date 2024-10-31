@@ -87,11 +87,8 @@ class RWKV6Attention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=getattr(config, 'attention_output_bias', config.attention_bias))
 
-        self.gate = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        # start gate out with no effect
+        self.gate = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         nn.init.zeros_(self.gate.weight)
-        with torch.no_grad():
-            self.gate.bias[:] = 1.227
 
         n_layer = self.config.num_hidden_layers
         n_embd = self.hidden_size
@@ -168,7 +165,7 @@ class RWKV6Attention(nn.Module):
         key_states = self.k_proj(xk)
         value_states = self.v_proj(xv)
         decay_states = (self.time_decay + torch.tanh(xw @ self.time_decay_w1) @ self.time_decay_w2).to(query_states.dtype)
-        gate_states = F.silu(self.gate(xg))
+        gate_states = F.sigmoid(self.gate(xg))
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
