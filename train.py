@@ -130,6 +130,16 @@ def tokenize_all(data, tokenizer, block_size : int, crop_n_blocks:int = 999999):
     # NOTE - HF requires the labels be the same as the input_ids, which is essentially an off by one error on their part
     return dict(input_ids=output_batch, labels=output_batch) # different size than input_batch
 
+alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+### Instruction:
+{}
+### Input:
+{}
+### Response:
+{}"""
+def format_alpaca(examples, tokenizer):
+    return { 'text' : [alpaca_prompt.format(*entries) for entries in zip(examples['instruction'], examples['input'], examples['output'])] }
+
 def main():
     config, errors = parse_cmdline_configs(sys.argv[1:], base_config_type=CLI_Config)
     if errors != '':
@@ -167,8 +177,11 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
     train_dataset = load_dataset(config.train.train_dataset_path, split=config.train.train_dataset_split, streaming=True)
-
-    train_dataset = train_dataset.map(lambda x: tokenize_all(x, tokenizer, config.train.sequence_length, 8), batched=True, remove_columns=train_dataset.column_names)
+   
+    if 'alpaca' in config.train.train_dataset_path:
+        train_dataset = train_dataset.map(lambda x: tokenize_all(format_alpaca(x, tokenizer), tokenizer, config.train.sequence_length, 8), batched=True, remove_columns=train_dataset.column_names)
+    else:
+        train_dataset = train_dataset.map(lambda x: tokenize_all(x, tokenizer, config.train.sequence_length, 8), batched=True, remove_columns=train_dataset.column_names)
 
     train_dataset = train_dataset.take(config.train.token_count)
 
