@@ -154,8 +154,8 @@ class RWKV6State(Cache):
         # Update the cache
         # There may be skipped layers, fill them with empty lists
         for _ in range(len(self.layer_kv_states), layer_idx + 1):
-            self.layer_kv_states.append(kv_state.new_zeros())
-            self.layer_shift_states.append(shift_state.new_zeros())
+            self.layer_kv_states.append(torch.zeros_like(kv_state).requires_grad_(False))
+            self.layer_shift_states.append(torch.zeros_like(shift_state).requires_grad_(False))
         self.layer_kv_states[layer_idx].copy_(kv_state)
         self.layer_shift_states[layer_idx].copy_(shift_state)
 
@@ -285,7 +285,7 @@ class RWKV6Attention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
     ):
-        output_shift_state = hidden_states[:, -1:]
+        output_shift_state = hidden_states[:, -1:].detach().clone()
 
         bsz, q_len, hidden_dim = hidden_states.size()
         H = self.num_heads
@@ -571,7 +571,7 @@ class RWKV6Qwen2Model(RWKV6Qwen2PreTrainedModel):
 
         # kept for BC (non `Cache` `past_key_values` inputs)
         #return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):
+        if use_cache and not isinstance(past_key_values, RWKV6State):
             #return_legacy_cache = True
             past_key_values = RWKV6State()
             # if past_key_values is None:
