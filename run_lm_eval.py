@@ -56,25 +56,16 @@ print(f'Loading model - {config.model_path}')
 
 model_config = AutoConfig.from_pretrained(config.model_path)
 
-# FIXME - hardcoded for now, but it'd be great if we could specify this in data somewhere per model type (or even analyze the weights to see)
-# NOTE - when loading a custom Qwen2RWKV model we don't need to set model_config.attention_bias and model_config.attention_output_bias, because the model config contains it
-if 'Qwen/Qwen' in config.model_path:
-    model_config.attention_bias = True
-    model_config.attention_output_bias = False
-
-# replace attention classes
-ReplacementSelfAttentionType = locate(config.attn_path)
-assert isinstance(ReplacementSelfAttentionType, Callable)
-attn_classes_dict = locate(config.attn_classes_path)
-assert isinstance(attn_classes_dict, dict), 'could not find attention classes dict at path provided'
-for key in list(attn_classes_dict.keys()):
-    attn_classes_dict[key] = ReplacementSelfAttentionType
+if config.model_path.startswith('.') or config.model_path.startswith('/'):
+    # replace attention classes
+    ReplacementSelfAttentionType = locate(config.attn_path)
+    assert isinstance(ReplacementSelfAttentionType, Callable)
+    attn_classes_dict = locate(config.attn_classes_path)
+    assert isinstance(attn_classes_dict, dict), 'could not find attention classes dict at path provided'
+    for key in list(attn_classes_dict.keys()):
+        attn_classes_dict[key] = ReplacementSelfAttentionType
 
 model = AutoModelForCausalLM.from_pretrained(config.model_path, config=model_config, torch_dtype=dtype, device_map='cuda')
-
-# UNNECESSARY because leave the config saying that they're tied, so it will treat them as tied even though they're both saved
-# re-tie embeddings
-#model.get_output_embeddings().weight = model.get_input_embeddings().weight
 
 tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_path)
 
