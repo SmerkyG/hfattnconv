@@ -4,7 +4,7 @@ train:
   output_dir: out3
   sequence_length: 512
   train_dataset_path: robbiegwaldd/dclm-10B
-  token_count: 700000000
+  token_count: 100000000
   training_args:
     output_dir: out
     bf16: True
@@ -18,4 +18,5 @@ train:
     save_total_limit: 1
     include_tokens_per_second: True
     logging_steps: 10
-    dataloader_num_workers: 8
+    dataloader_num_workers: 2
+    save_steps: 1100
