@@ -1,0 +1,5 @@
+tokenizer_path: Qwen/Qwen2.5-32B-Instruct
+model_path: Qwen/Qwen2.5-32B-Instruct
+attn_classes_path: transformers.models.qwen2.modeling_qwen2.QWEN2_ATTENTION_CLASSES
+train:
+  teacher_model_path: Qwen/Qwen2.5-32B-Instruct
