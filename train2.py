@@ -73,14 +73,8 @@ class Train_Config:
     precision:str = 'bf16'
     accumulate_grad_batches:int = 1
 
-    #training_args: TrainingArguments = field(default_factory=lambda: TrainingArguments(output_dir='out', bf16=True, 
     per_device_train_batch_size:int = 4
     gradient_checkpointing:bool=False
-    # include_tokens_per_second=True, 
-    #learning_rate:float=1e-3
-    #adam_beta1:float=0.9
-    #adam_beta2:float=0.95
-    #lr_scheduler_type:str='cosine'
     dataloader_num_workers:int=2 # FIXME - this was 1 in the original code
 
 @dataclass(kw_only=True)
@@ -162,10 +156,6 @@ class LightningModelWrapper(pl.LightningModule):
                 # NOTE - HF requires the labels be the same as the input_ids, which is essentially an off by one error on their part
                 ce_loss = ce_loss + F.cross_entropy(student_logits[b][..., :-1, :].view(-1, student_logits.size(-1)), labels[b][..., 1:].flatten())
             ce_loss = ce_loss / student_logits.size(0)
-            #if (batch_idx + 0) % 10 == 0:
-            #    #self.log(dict(ce_loss = float(ce_loss.item())))
-            #    print('ce_loss', float(ce_loss.item()))
-            #del ce_loss
 
             # memory saving measure, because otherwise kl_div tried to allocate everything all at once
             distillation_loss = torch.tensor(0.0, device=student_logits.device, dtype=student_logits.dtype)
@@ -329,8 +319,6 @@ if __name__ == "__main__":
 
     pl.seed_everything(config.train.seed_everything)
 
-    train_config = config.train
-
     attention_distillation_stage = config.train.attention_distillation_stage
     assert attention_distillation_stage in (0,2,3)
 
@@ -356,7 +344,7 @@ if __name__ == "__main__":
 
     wrapper = LightningModelWrapper(model, config, teacher) # delay setting the teacher until after init so deepspeed_stage_3 doesn't break it
 
-    strategy_obj = train_config.strategy
+    strategy_obj = config.train.strategy
 
     logger = False
     if config.train.wandb is not None and config.train.wandb != '':
