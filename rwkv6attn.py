@@ -27,24 +27,11 @@ from transformers.cache_utils import Cache, DynamicCache, StaticCache
 
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from fla.ops.gla.chunk import chunk_gla, ChunkGLAFunction
+from fla.ops.gla.chunk import chunk_gla
 from pydoc import locate
 
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
-
-def fla_chunk_gla(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,  # log decay
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    scale = q.shape[-1] ** -0.5
-    g = g.float()
-    initial_state = None
-    output_final_state = False
-    o, final_state = ChunkGLAFunction.apply(q, k, v, g, scale, initial_state, output_final_state)
-    return o, final_state
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -210,7 +197,7 @@ class RWKV6Attention(nn.Module):
         attn_weights = torch.empty(0, device=x.device)
 
         #attn_output = fla_chunk_simple_gla(query_states, key_states, value_states, decay_states_log.view(bsz, self.num_heads, q_len))[0]
-        attn_output = fla_chunk_gla(query_states, key_states, value_states, decay_states_log)[0]
+        attn_output = chunk_gla(query_states, key_states, value_states, decay_states_log, scale=None, initial_state=None, output_final_state=False)[0]
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output * gate_states)
