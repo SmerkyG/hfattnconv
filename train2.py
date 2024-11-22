@@ -398,9 +398,10 @@ if __name__ == "__main__":
     if 'deepspeed_stage_3' in config.train.strategy:
         # NOTE - have to get state_dict on all ranks (it only returns the actual dict on rank zero)
         state_dict = trainer.strategy.deepspeed_engine._zero3_consolidated_16bit_state_dict()
-        for n in list(state_dict.keys()):
-            if n.startswith('model.'):
-                state_dict[n[len('model.'):]] = state_dict.pop(n)
+        if state_dict is not None: # can be None on ranks other than zero
+            for n in list(state_dict.keys()):
+                if n.startswith('model.'):
+                    state_dict[n[len('model.'):]] = state_dict.pop(n)
     else:
         state_dict = None
     if trainer.global_rank == 0:
