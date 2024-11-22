@@ -52,7 +52,7 @@ class DistillationTrainer(Trainer):
         # this will be removed from the model when training starts, via the RemoveTeacherCallback
         self.model.teacher = teacher
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # remove the labels so that the model doesn't bother computing loss
         labels = inputs.pop("labels")
 
@@ -89,7 +89,7 @@ class DistillationTrainer(Trainer):
         return (distillation_loss, outputs) if return_outputs else distillation_loss
 
 class AttentionDistillationTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # remove the labels so that the model doesn't bother computing loss
         inputs.pop("labels")
         #inputs['return_dict'] = True
