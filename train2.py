@@ -123,9 +123,9 @@ class LightningModelWrapper(pl.LightningModule):
         ]
         betas = (train_config.beta1, train_config.beta2)
 
-        from torch.optim import AdamW
-        optimizer_class = AdamW # optimizer_kwargs.update({"fused": True})
-        #optimizer_class = FusedAdam
+        #from torch.optim import AdamW
+        #optimizer_class = AdamW # optimizer_kwargs.update({"fused": True})
+        optimizer_class = FusedAdam
 
         opt = optimizer_class(optim_groups, lr=train_config.lr_init, betas=betas, eps=train_config.adam_eps, weight_decay=train_config.weight_decay) #, bias_correction=True, adam_w_mode=True, amsgrad=False)
         return opt
