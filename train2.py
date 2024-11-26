@@ -26,7 +26,7 @@ from logger import print0 as print
 
 import metrics
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict, is_dataclass
 
 @dataclass(kw_only=True)
 class Train_Config:
@@ -90,6 +90,10 @@ class CLI_Config:
 class LightningModelWrapper(pl.LightningModule):
     def __init__(self, model:nn.Module, config:CLI_Config, teacher:nn.Module|None=None):
         super().__init__()
+
+        # make wandb save the config, so you can look back and see all hyperparameters later
+        self.save_hyperparameters(dict(config=asdict(config) if is_dataclass(config) else config))
+
         self.model = model
         self.config = config
         self.teacher = teacher
