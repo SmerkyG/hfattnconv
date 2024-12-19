@@ -29,6 +29,7 @@ class Train_Config:
     train_dataset_column:str = 'text'
     attention_distillation_stage:int = 0
     teacher_model_path: str = ''
+    hf_config_path: str = ''
     sequence_length: int = 512
     token_count: int = 40_000_000
 
@@ -89,22 +90,22 @@ class CLI_Config:
 # cfg = CLI_Config(
 #     tokenizer_path="Qwen/Qwen2.5-7B-Instruct",
 #     model_path="/share/qrwkv/out/L28-D3584-qwen2-2/rwkv-final.pth",
-#     train=Train_Config(wandb='huggingface', output_dir='QRWKV-7B-Instruct', token_count=500_000_000, attention_distillation_stage=3, per_device_train_batch_size=12, lr_init=1e-5, lr_final=1e-5, teacher_model_path='Qwen/Qwen2.5-7B-Instruct', train_dataset_path='robbiegwaldd/dclm-10B'),
-# )
-
-# cfg = CLI_Config(
-#     tokenizer_path="Qwen/Qwen2.5-32B-Instruct",
-#     model_path="/share/qrwkv/out/L64-D5120-qwen2-16384-3/rwkv-final.pth",
-#     train=Train_Config(wandb='huggingface', output_dir='QRWKV-32B-Instruct', token_count=500_000_000, attention_distillation_stage=3, per_device_train_batch_size=12, lr_init=1e-5, lr_final=1e-5, teacher_model_path='Qwen/Qwen2.5-32B-Instruct', train_dataset_path='robbiegwaldd/dclm-10B'),
+#     train=Train_Config(wandb='huggingface', output_dir='QRWKV-7B-Instruct', token_count=500_000_000, attention_distillation_stage=3, per_device_train_batch_size=12, gradient_checkpointing=True, lr_init=1e-5, lr_final=1e-5, teacher_model_path='Qwen/Qwen2.5-7B-Instruct', train_dataset_path='robbiegwaldd/dclm-10B'),
 # )
 
 cfg = CLI_Config(
-    tokenizer_path="Qwen/Qwen2.5-72B-Instruct",
-    model_path="/share/qrwkv/out/L80-D8192-qwen2-2/rwkv-final.pth",
-    train=Train_Config(wandb='huggingface', output_dir='QRWKV-72B-Instruct', token_count=500_000_000, attention_distillation_stage=3, per_device_train_batch_size=12, lr_init=1e-5, lr_final=1e-5, teacher_model_path='Qwen/Qwen2.5-72B-Instruct', train_dataset_path='robbiegwaldd/dclm-10B'),
+    tokenizer_path="Qwen/Qwen2.5-32B-Instruct",
+    model_path="/share/qrwkv/out/L64-D5120-qwen2-16384-3/rwkv-final.pth",
+    train=Train_Config(wandb='', output_dir='QRWKV-32B-Instruct', token_count=500_000_000, attention_distillation_stage=3, per_device_train_batch_size=12, gradient_checkpointing=True, lr_init=1e-5, lr_final=1e-5, hf_config_path='Qwen/Qwen2.5-32B-Instruct', teacher_model_path='Qwen/Qwen2.5-32B-Instruct', train_dataset_path='robbiegwaldd/dclm-10B'),
 )
 
-def tokenize_all(data, tokenizer, block_size : int, crop_n_blocks:int = 999999):
+# cfg = CLI_Config(
+#     tokenizer_path="Qwen/Qwen2.5-72B-Instruct",
+#     model_path="/share/qrwkv/out/L80-D8192-qwen2-2/rwkv-final.pth",
+#     train=Train_Config(wandb='huggingface', output_dir='QRWKV-72B-Instruct', token_count=500_000_000, attention_distillation_stage=3, per_device_train_batch_size=12, gradient_checkpointing=True, lr_init=1e-5, lr_final=1e-5, teacher_model_path='Qwen/Qwen2.5-72B-Instruct', train_dataset_path='robbiegwaldd/dclm-10B'),
+# )
+
+def tokenize_all(data, tokenizer, sequence_length : int, crop_n_blocks:int = 999999):
     # temporarily set tokenizer.model_max_length to avoid warnings when tokenizing long strings
     temp_max_length = getattr(tokenizer, 'model_max_length', None)
     tokenizer.model_max_length=int(1e30)
@@ -115,6 +116,7 @@ def tokenize_all(data, tokenizer, block_size : int, crop_n_blocks:int = 999999):
     text_tensors = [torch.tensor(tokens, dtype=dt) for tokens in tokenized]
     eos_tensor = torch.tensor([tokenizer.eos_token_id], dtype=dt)
 
+    block_size = sequence_length + 1
     output_batch = []
     current = torch.tensor([], dtype=dt)
     for text_tensor in text_tensors:
@@ -133,8 +135,7 @@ def tokenize_all(data, tokenizer, block_size : int, crop_n_blocks:int = 999999):
     # reset tokenizer.model_max_length
     tokenizer.model_max_length = temp_max_length
 
-    # NOTE - HF requires the labels be the same as the input_ids, which is essentially an off by one error on their part
-    return dict(input_ids=output_batch, labels=output_batch)
+    return dict(input_ids=output_batch)
 
 class DistributedIterableDatasetWrapper(IterableDataset):
     def __init__(self, wrapped_dataset):
@@ -181,9 +182,7 @@ def _get_loss_logits_preds(batch, model, teacher, attention_distillation_stage):
 
         flat_student_logits = student_logits.view(-1, student_logits.size(-1))
 
-        # FIXME - get rid of memory saving measure during everything but stage 4
-
-        chunk_loss_calcs = True #attention_distillation_stage == 4
+        chunk_loss_calcs = False #attention_distillation_stage == 4
         flat_labels = labels.flatten()
         if not chunk_loss_calcs:
             reported_loss = training_loss = ce_loss = F.cross_entropy(flat_student_logits, flat_labels)
@@ -228,10 +227,6 @@ def _get_loss_logits_preds(batch, model, teacher, attention_distillation_stage):
 
     assert attention_distillation_stage == 3
     return None, None, None, None # unreachable code
-
-teacher_ckpt_path = cfg.train.teacher_model_path # "Qwen/Qwen2.5-32B-Instruct"
-ckpt_path = cfg.model_path # "/share/qrwkv/out/L64-D5120-qwen2-16384-3/rwkv-final.pth" # "/share/qrwkv/out/L80-D8192-qwen2-2/rwkv-final.pth"
-#hf_config_path = "Qwen/Qwen2.5-32B-Instruct"
 
 # replace Qwen2RMSNorm with a version that supports reset_parameters for FSDP
 import transformers.models.qwen2.modeling_qwen2 as modeling_qwen2
@@ -293,16 +288,18 @@ class AttentionDistillationWrapper(nn.Module):
 
 def create_and_patch_model(cfg:CLI_Config, dtype):
     #print("loading config")
-    if cfg.train.attention_distillation_stage == 2:
-        hf_config = AutoConfig.from_pretrained(cfg.model_path)
-    elif cfg.train.attention_distillation_stage == 3:
-        hf_config = AutoConfig.from_pretrained(cfg.train.teacher_model_path)
+    if cfg.model_path.lower().endswith('.pth') or cfg.model_path.lower().endswith('.safetensors'):
+        hf_config_path = cfg.train.hf_config_path
+        assert cfg.train.hf_config_path != ''
+    else:
+        hf_config_path = cfg.model_path
+    hf_config = AutoConfig.from_pretrained(hf_config_path)
 
     # FIXME - hardcoded for now, but it'd be great if we could specify this in data somewhere per model type (or even analyze the weights to see)
     # NOTE - when loading a custom Qwen2RWKV model we don't need to set hf_config.attention_bias and model_config.attention_output_bias, because the model config contains it
-    #if 'Qwen/Qwen' in hf_config_path:
-    hf_config.attention_bias = True
-    hf_config.attention_output_bias = False       
+    if 'Qwen/Qwen' in hf_config_path:
+        hf_config.attention_bias = True
+        hf_config.attention_output_bias = False       
 
     ReplacementSelfAttentionType = locate(cfg.attn_path)
     assert isinstance(ReplacementSelfAttentionType, Callable)
@@ -381,7 +378,7 @@ class Trainer():
                 print("loading student model")
                 with (nullcontext if dist.get_rank() == 0 else init_on_meta_device)(): # init on meta device everywhere but rank 0
                     # FIXME - maybe load from_config instead of from_pretrained for meta device non-rank0?
-                    student_model = AutoModelForCausalLM.from_pretrained(ckpt_path, torch_dtype=dtype)
+                    student_model = AutoModelForCausalLM.from_pretrained(cfg.model_path, torch_dtype=dtype)
 
                 # FIXME - patch student_model as desired
                 student_model.requires_grad = False
@@ -396,7 +393,7 @@ class Trainer():
 
                 if dist.get_rank() == 0:
                     print("loading student state dict")
-                    state_dict = torch.load(ckpt_path, weights_only=True)
+                    state_dict = torch.load(cfg.model_path, weights_only=True)
                     print("populating student model")
                     student_model.load_state_dict(state_dict, assign=True)
                     # NOTE - model should not require patching here if the loaded checkpoint was saved in the final format
@@ -404,11 +401,11 @@ class Trainer():
                 if distillation_stage == 3:
                     print("loading teacher model")
                     if dist.get_rank() == 0:
-                        teacher_model = AutoModelForCausalLM.from_pretrained(teacher_ckpt_path, torch_dtype=dtype)
+                        teacher_model = AutoModelForCausalLM.from_pretrained(cfg.train.teacher_model_path, torch_dtype=dtype)
                     else:
                         with init_on_meta_device():
                             #print("loading teacher config")
-                            teacher_hf_config = AutoConfig.from_pretrained(teacher_ckpt_path)
+                            teacher_hf_config = AutoConfig.from_pretrained(cfg.train.teacher_model_path)
                             teacher_model = AutoModelForCausalLM.from_config(teacher_hf_config, torch_dtype=dtype)
                     teacher_model.requires_grad = False
                     teacher_model.eval()
@@ -420,7 +417,6 @@ class Trainer():
             from transformers import models
 
             fsdp_auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=int(1e6))
-            activation_checkpointing_policy = ModuleWrapPolicy({ models.qwen2.modeling_qwen2.Qwen2DecoderLayer })
 
             # initializes parameters that are on meta devices
             def init_fn(x: nn.Module):
@@ -431,23 +427,29 @@ class Trainer():
 
             # TODO: enable other policies
             mp_policy = MixedPrecision(
-                param_dtype=dtype,
+                param_dtype=dtype, # FIXME - seems like lightning's FSDPPrecisionPlugin MixedPrecisionConfig maybe uses torch.float32 for this
                 reduce_dtype=dtype,
                 buffer_dtype=dtype,
             )
 
             dp_strategy = ShardingStrategy.FULL_SHARD
 
-            self.wrapped_student_model = FSDP(student_model, device_id=device, param_init_fn=init_fn, auto_wrap_policy=fsdp_auto_wrap_policy, sync_module_states=True, limit_all_gathers=True, mixed_precision=mp_policy, sharding_strategy=dp_strategy)
+            limit_all_gathers = True
 
-            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing, checkpoint_wrapper
-            apply_activation_checkpointing(self.wrapped_student_model, checkpoint_wrapper_fn=checkpoint_wrapper, auto_wrap_policy=activation_checkpointing_policy)
+            self.wrapped_student_model = FSDP(student_model, device_id=device, param_init_fn=init_fn, auto_wrap_policy=fsdp_auto_wrap_policy, sync_module_states=True)#, limit_all_gathers=limit_all_gathers, mixed_precision=mp_policy, sharding_strategy=dp_strategy)
+
+            if cfg.train.gradient_checkpointing:
+                #from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing, checkpoint_wrapper, CheckpointImpl
+                # activation_checkpointing_policy = ModuleWrapPolicy({ models.qwen2.modeling_qwen2.Qwen2DecoderLayer })
+                # apply_activation_checkpointing(self.wrapped_student_model, checkpoint_wrapper_fn=partial(checkpoint_wrapper, checkpoint_impl = CheckpointImpl.NO_REENTRANT), auto_wrap_policy=activation_checkpointing_policy)
+                from torch.utils.checkpoint import checkpoint as torch_utils_checkpoint
+                self.wrapped_student_model._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=partial(torch_utils_checkpoint, use_reentrant = False))
 
             self.wrapped_teacher_model = None
             if teacher_model is not None:
                 print("placing teacher model onto FSDP")
                 #self.wrapped_teacher_model = FSDP(teacher_model, device_id=device, sync_module_states=True) # auto_wrap_policy=..., 
-                self.wrapped_teacher_model = FSDP(teacher_model, device_id=device, param_init_fn=init_fn, auto_wrap_policy=fsdp_auto_wrap_policy, sync_module_states=True, limit_all_gathers=True, mixed_precision=mp_policy, sharding_strategy=dp_strategy)
+                self.wrapped_teacher_model = FSDP(teacher_model, device_id=device, param_init_fn=init_fn, auto_wrap_policy=fsdp_auto_wrap_policy, sync_module_states=True)#, limit_all_gathers=limit_all_gathers, mixed_precision=mp_policy, sharding_strategy=dp_strategy)
 
             print("creating optimizer")
             self.optimizer = torch.optim.Adam(self.wrapped_student_model.parameters(), lr=cfg.train.lr_init, betas=(cfg.train.beta1, cfg.train.beta2), eps=cfg.train.adam_eps)
@@ -494,6 +496,8 @@ class Trainer():
 
             my_wandb = None
 
+            scaler = torch.amp.GradScaler(enabled = (self.dtype == torch.float16))
+
             print("getting first entry from dataset...")
             self.batch_idx = 0
             self.global_step = 0
@@ -504,31 +508,27 @@ class Trainer():
 
                 step_start_time = time.time()
 
-                input_ids = batch['input_ids']
-                batch['labels'] = batch['labels'].to(self.device)
-                labels = batch['labels']
+                batch['input_ids'] = batch['input_ids'].to(self.device)
+                batch['labels'] = labels = batch['input_ids'][:, 1:]
+                batch['input_ids'] = input_ids = batch['input_ids'][:, :-1]
 
-                # NOTE - HF requires the labels be the same as the input_ids, which is essentially an off by one error on their part
-                # this is really stupid, forcing us to waste a slot
-                input_ids = input_ids[:, :-1]
-                labels = labels[:, 1:]
-                batch['input_ids'] = input_ids
-                batch['labels'] = labels
+                with torch.autocast(device_type='cuda', dtype=self.dtype):
+                    training_loss, reported_loss, student_logits, student_preds = _get_loss_logits_preds(batch, self.wrapped_student_model, self.wrapped_teacher_model, cfg.train.attention_distillation_stage)
+                    scaler.scale(training_loss).backward()
 
-                training_loss, reported_loss, student_logits, student_preds = _get_loss_logits_preds(batch, self.wrapped_student_model, self.wrapped_teacher_model, cfg.train.attention_distillation_stage)
+                if (self.batch_idx + 1) % cfg.train.accumulate_grad_batches == 0:
+                    # FIXME - add lr_decay support
 
-                training_loss.backward()
+                    if cfg.train.gradient_clip_val is not None and cfg.train.gradient_clip_val > 0:
+                        scaler.unscale_(self.optimizer)
+                        if isinstance(self.wrapped_student_model, FSDP): #cfg.train.strategy == 'fsdp':
+                            self.wrapped_student_model.clip_grad_norm_(cfg.train.gradient_clip_val)
+                        else:
+                            nn.utils.clip_grad_norm_(parameters=self.wrapped_student_model.parameters(), max_norm=cfg.train.gradient_clip_val)
 
-                # FIXME - add gradient clipping
-                if cfg.train.gradient_clip_val is not None and cfg.train.gradient_clip_val > 0:
-                    if isinstance(self.wrapped_student_model, FSDP): #cfg.train.strategy == 'fsdp':
-                        self.wrapped_student_model.clip_grad_norm_(cfg.train.gradient_clip_val)
-                    else:
-                        nn.utils.clip_grad_norm_(parameters=self.wrapped_student_model.parameters(), max_norm=cfg.train.gradient_clip_val)
-
-                # FIXME - add gradient accumulation support
-
-                self.optimizer.step()
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                    self.optimizer.zero_grad()
 
                 # init wandb late, so that if we crash during the first step it doesn't generate a pointless wandb log entry
                 if self.batch_idx == 0:
@@ -544,8 +544,7 @@ class Trainer():
                             )
                             my_wandb = wandb
 
-                # FIXME - metrics and logging
-
+                # metrics and logging
                 if reported_loss is not None:
                     ce_loss_margs = metrics.MetricArgs(input_ids, student_logits, student_preds, labels, reported_loss)
                 margs = metrics.MetricArgs(input_ids, student_logits, student_preds, labels, training_loss)
@@ -557,7 +556,7 @@ class Trainer():
                     #print("loss", float(reported_loss.item()))
                     time_since_prev_step = time.time() - prev_step_start_time
                     tok_per_sec = self.tokens_per_microbatch_step / time_since_prev_step
-                    print(f"step {self.batch_idx} kl_loss:{float(training_loss.item()):.2f} ce_loss:{float(reported_loss.item()):.2f} kt/s:{tok_per_sec/ 1000.0:.2f}")
+                    print(f"step {self.batch_idx} kl_loss:{float(training_loss.item()):.2f} ce_loss:{float(reported_loss.item()):.2f} mtok:{self.tokens_processed/1000000.0:.2f} kt/s:{tok_per_sec/1000.0:.2f}")
                     if (self.batch_idx + 1) % cfg.train.accumulate_grad_batches == 0:
                         if (self.global_step + 1) % cfg.train.log_every_n_steps == 0:
                             logdict = dict(tokens = float(self.tokens_processed))
@@ -585,7 +584,7 @@ class Trainer():
 
             print("completed")
 
-            # FIXME - add saving (and maybe checkpointing along the way)
+            # FIXME - add checkpointing along the way
 
         except:
             print("error encountered")
@@ -601,13 +600,7 @@ class Trainer():
                 # annoyingly, we are REQUIRED to get the state dict from the FSDP module, which is only the top level LightningModelWrapper
                 # so, get it, then edit the dict to remove the `model.` prefix
 
-                assert(any(isinstance(m, FSDP) for m in model.modules()))
-                # FIXME - context manager was crashing on release
-                # FSDP.set_state_dict_type(
-                #     model,
-                #     StateDictType.FULL_STATE_DICT,
-                #     FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-                # )
+                #assert(any(isinstance(m, FSDP) for m in model.modules()))
                 with FSDP.state_dict_type(
                     model,
                     StateDictType.FULL_STATE_DICT,
@@ -631,7 +624,16 @@ class Trainer():
             dist.destroy_process_group()
             raise
 
+import sys, os
+from configs import parse_cmdline_configs
+
 def main():
+    # cfg, errors = parse_cmdline_configs(sys.argv[1:], base_config_type=CLI_Config)
+    # cfg:CLI_Config
+    # if errors != '':
+    #     print(errors)
+    #     exit()
+
     trainer = Trainer(cfg)
     trainer.setup()
     trainer.train()

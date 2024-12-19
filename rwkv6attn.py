@@ -27,7 +27,7 @@ from transformers.cache_utils import Cache, DynamicCache, StaticCache
 
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from fla.ops.gla.chunk import chunk_gla
+from fla.ops.gla.fused_recurrent import fused_recurrent_gla
 from pydoc import locate
 
 from transformers.utils import logging
@@ -162,42 +162,43 @@ class RWKV6Attention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-        dropout_rate = 0.0 if not self.training else self.attention_dropout
+        #dropout_rate = 0.0 if not self.training else self.attention_dropout
 
         decay_states_log = -decay_states.float().exp()
-        #decay_states_log = decay_states_log.clamp(-5) # FIXME - is this necessary?
+        decay_states_log = decay_states_log.clamp(-5) # FIXME - is this necessary? YES! At least on mi300x
         key_states = (key_states * (1 - decay_states_log.exp())).to(key_states.dtype)
 
         query_states = query_states.to(value_states.dtype)
         key_states = key_states.to(value_states.dtype)
 
-        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-        # therefore the input hidden states gets silently casted in float32. Hence, we need
-        # cast them back in float16 just to be sure everything works as expected.
-        input_dtype = query_states.dtype
-        if input_dtype == torch.float32:
-            if torch.is_autocast_enabled():
-                target_dtype = torch.get_autocast_gpu_dtype()
-            # Handle the case where the model is quantized
-            elif hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
-            else:
-                target_dtype = self.q_proj.weight.dtype
+        # # In PEFT, usually we cast the layer norms in float32 for training stability reasons
+        # # therefore the input hidden states gets silently casted in float32. Hence, we need
+        # # cast them back in float16 just to be sure everything works as expected.
+        # input_dtype = query_states.dtype
+        # if input_dtype == torch.float32:
+        #     if torch.is_autocast_enabled():
+        #         target_dtype = torch.get_autocast_gpu_dtype()
+        #     # Handle the case where the model is quantized
+        #     elif hasattr(self.config, "_pre_quantization_dtype"):
+        #         target_dtype = self.config._pre_quantization_dtype
+        #     else:
+        #         target_dtype = self.q_proj.weight.dtype
 
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
-            )
+        #     logger.warning_once(
+        #         f"The input hidden states seems to be silently casted in float32, this might be related to"
+        #         f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+        #         f" {target_dtype}."
+        #     )
 
-            query_states = query_states.to(target_dtype)
-            key_states = key_states.to(target_dtype)
-            value_states = value_states.to(target_dtype)
+        #     query_states = query_states.to(target_dtype)
+        #     key_states = key_states.to(target_dtype)
+        #     value_states = value_states.to(target_dtype)
 
         attn_weights = torch.empty(0, device=x.device)
 
         #attn_output = fla_chunk_simple_gla(query_states, key_states, value_states, decay_states_log.view(bsz, self.num_heads, q_len))[0]
-        attn_output = chunk_gla(query_states, key_states, value_states, decay_states_log, scale=None, initial_state=None, output_final_state=False)[0]
+        #attn_output = chunk_gla(query_states, key_states, value_states, decay_states_log, scale=None, initial_state=None, output_final_state=False)[0]
+        attn_output = fused_recurrent_gla(query_states, key_states, value_states, decay_states_log)[0]
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output * gate_states)
