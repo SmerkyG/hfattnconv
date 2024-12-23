@@ -60,6 +60,7 @@ _CONFIG_FOR_DOC = "RWKV6Qwen2Config"
 
 class RWKV6State(Cache):
     def __init__(self) -> None:
+        super().__init__()
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
         self.layer_kv_states: List[torch.Tensor] = []
         self.layer_shift_states:  List[torch.Tensor] = []
@@ -203,7 +204,14 @@ class RWKV6State(Cache):
     #         self.key_cache[layer_idx] = self.key_cache[layer_idx][indices, ...]
     #         self.value_cache[layer_idx] = self.value_cache[layer_idx][indices, ...]
 
-from fla.ops.gla.chunk import ChunkGLAFunction
+try:
+    #from fla.ops.gla.chunk import chunk_gla
+    from fla.ops.gla.fused_recurrent import fused_recurrent_gla
+except ImportError:
+    print("Required module is not installed. Please install it using the following commands:")
+    print("pip install -U git+https://github.com/sustcsonglin/flash-linear-attention")
+    print("Additionally, ensure you have at least version 2.2.0 of Triton installed:")
+    print("pip install triton>=2.2.0")
 
 class RWKV6Attention(nn.Module):
     def __init__(self, config, layer_idx: Optional[int] = None):
@@ -235,11 +243,8 @@ class RWKV6Attention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=getattr(config, 'attention_output_bias', config.attention_bias))
 
-        self.gate = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        # start gate out with no effect
+        self.gate = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         nn.init.zeros_(self.gate.weight)
-        with torch.no_grad():
-            self.gate.bias[:] = 1.227
 
         n_layer = self.config.num_hidden_layers
         n_embd = self.hidden_size
@@ -316,7 +321,7 @@ class RWKV6Attention(nn.Module):
         key_states = self.k_proj(xk)
         value_states = self.v_proj(xv)
         decay_states = (self.time_decay + torch.tanh(xw @ self.time_decay_w1) @ self.time_decay_w2).to(query_states.dtype)
-        gate_states = F.silu(self.gate(xg))
+        gate_states = F.sigmoid(self.gate(xg))
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -362,7 +367,10 @@ class RWKV6Attention(nn.Module):
 
         scale = query_states.shape[-1] ** -0.5
         output_final_state = not self.training and use_cache and past_key_value is not None
-        attn_output, output_kv_state = ChunkGLAFunction.apply(query_states, key_states, value_states, decay_states_log.float(), scale, input_kv_state, output_final_state)
+        #attn_output, output_kv_state = ChunkGLAFunction.apply(query_states, key_states, value_states, decay_states_log.float(), scale, input_kv_state, output_final_state)
+        #attn_output, output_kv_state = chunk_gla(query_states, key_states, value_states, decay_states_log, scale, input_kv_state, output_final_state)
+        attn_output, output_kv_state = fused_recurrent_gla(query_states, key_states, value_states, decay_states_log, None, scale, input_kv_state, output_final_state)
+
         if output_final_state:
             past_key_value.update(output_kv_state, output_shift_state, q_len, self.layer_idx)
 
