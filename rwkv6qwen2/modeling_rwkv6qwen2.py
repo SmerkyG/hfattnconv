@@ -29,7 +29,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from transformers.cache_utils import Cache, StaticCache
+from transformers.cache_utils import Cache, StaticCache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -209,7 +209,7 @@ try:
     from fla.ops.gla.fused_recurrent import fused_recurrent_gla
 except ImportError:
     print("Required module is not installed. Please install it using the following commands:")
-    print("pip install -U git+https://github.com/sustcsonglin/flash-linear-attention")
+    print("pip install -U git+https://github.com/fla-org/flash-linear-attention")
     print("Additionally, ensure you have at least version 2.2.0 of Triton installed:")
     print("pip install triton>=2.2.0")
 
@@ -230,7 +230,6 @@ class RWKV6Attention(nn.Module):
         self.head_dim = getattr(config, 'head_dim', self.hidden_size // self.num_heads)
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.is_causal = True
         self.attention_dropout = config.attention_dropout
 
         if self.hidden_size % self.num_heads != 0:
@@ -284,7 +283,7 @@ class RWKV6Attention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[RWKV6State] = None,
+        past_key_values: Optional[RWKV6State] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -297,8 +296,8 @@ class RWKV6Attention(nn.Module):
 
         x = hidden_states
 
-        if use_cache and past_key_value is not None and len(past_key_value) > self.layer_idx:
-            input_kv_state, input_shift_state = past_key_value[self.layer_idx]
+        if use_cache and past_key_values is not None and len(past_key_values) > self.layer_idx:
+            input_kv_state, input_shift_state = past_key_values[self.layer_idx]
             xprev = torch.cat([input_shift_state, x[:, :-1]], dim=1)
         else:
             input_kv_state = None
@@ -334,8 +333,12 @@ class RWKV6Attention(nn.Module):
         dropout_rate = 0.0 if not self.training else self.attention_dropout
 
         decay_states_log = -decay_states.float().exp()
-        #decay_states_log = decay_states_log.clamp(-5) # FIXME - is this necessary?
+        decay_states_log = decay_states_log.clamp(-5) # FIXME - is this necessary?
         key_states = (key_states * (1 - decay_states_log.exp())).to(key_states.dtype)
+
+        if attention_mask is not None:
+            if q_len > 1:
+                decay_states_log = decay_states_log - 100 * F.pad(1 - attention_mask, [1, -1]).view(bsz, 1, q_len, 1)
 
         query_states = query_states.to(value_states.dtype)
         key_states = key_states.to(value_states.dtype)
@@ -366,19 +369,19 @@ class RWKV6Attention(nn.Module):
         attn_weights = torch.empty(0, device=x.device)
 
         scale = query_states.shape[-1] ** -0.5
-        output_final_state = not self.training and use_cache and past_key_value is not None
+        output_final_state = not self.training and use_cache and past_key_values is not None
         #attn_output, output_kv_state = ChunkGLAFunction.apply(query_states, key_states, value_states, decay_states_log.float(), scale, input_kv_state, output_final_state)
         #attn_output, output_kv_state = chunk_gla(query_states, key_states, value_states, decay_states_log, scale, input_kv_state, output_final_state)
         attn_output, output_kv_state = fused_recurrent_gla(query_states, key_states, value_states, decay_states_log, None, scale, input_kv_state, output_final_state)
 
         if output_final_state:
-            past_key_value.update(output_kv_state, output_shift_state, q_len, self.layer_idx)
+            past_key_values.update(output_kv_state, output_shift_state, q_len, self.layer_idx)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output * gate_states)
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
     
 class RWKV6Qwen2DecoderLayer(Qwen2DecoderLayer):
     def __init__(self, config: RWKV6Qwen2Config, layer_idx: int):
@@ -390,6 +393,48 @@ class RWKV6Qwen2DecoderLayer(Qwen2DecoderLayer):
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, self_attn_weights = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        return outputs
 
 RWKV6QWEN2_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
@@ -581,6 +626,7 @@ class RWKV6Qwen2Model(RWKV6Qwen2PreTrainedModel):
         #return_legacy_cache = False
         if use_cache and not isinstance(past_key_values, RWKV6State):
             #return_legacy_cache = True
+            print("creating past_key_values", past_key_values)
             past_key_values = RWKV6State()
             # if past_key_values is None:
             #     past_key_values = DynamicCache()
@@ -638,9 +684,9 @@ class RWKV6Qwen2Model(RWKV6Qwen2PreTrainedModel):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
-                    attention_mask=causal_mask,
+                    attention_mask=attention_mask,
                     position_ids=position_ids,
-                    past_key_value=past_key_values,
+                    past_key_values=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
@@ -648,9 +694,6 @@ class RWKV6Qwen2Model(RWKV6Qwen2PreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
-
-            if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -661,15 +704,14 @@ class RWKV6Qwen2Model(RWKV6Qwen2PreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None
         #if return_legacy_cache:
         #    next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(v for v in [hidden_states, past_key_values, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
@@ -793,130 +835,126 @@ class RWKV6Qwen2ForCausalLM(RWKV6Qwen2PreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
 
-    def prepare_inputs_for_generation(
-        self,
-        input_ids: torch.LongTensor,
-        past_key_values: Optional[Cache] = None,
-        attention_mask: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ):
-        """
-        Prepare the model inputs for generation. In includes operations like computing the 4D attention mask or
-        slicing inputs given the existing cache.
+    # def prepare_inputs_for_generation(
+    #     self,
+    #     input_ids: torch.LongTensor,
+    #     past_key_values: Optional[Cache] = None,
+    #     attention_mask: Optional[torch.LongTensor] = None,
+    #     inputs_embeds: Optional[torch.FloatTensor] = None,
+    #     cache_position: Optional[torch.LongTensor] = None,
+    #     **kwargs,
+    # ):
+    #     """
+    #     Prepare the model inputs for generation. In includes operations like computing the 4D attention mask or
+    #     slicing inputs given the existing cache.
 
-        See the forward pass in the model documentation for expected arguments (different models might have different
-        requirements for e.g. `past_key_values`). This function should work as is for most LLMs.
-        """
+    #     See the forward pass in the model documentation for expected arguments (different models might have different
+    #     requirements for e.g. `past_key_values`). This function should work as is for most LLMs.
+    #     """
 
-        # 1. Handle BC:
-        model_inputs = {}
-        # - some models don't have `Cache` support (which implies they don't expect `cache_position` in `forward`)
-        if self._supports_cache_class:
-            model_inputs["cache_position"] = cache_position
-        # - `cache_position` was not a mandatory input in `prepare_inputs_for_generation` for those models, and this
-        #   function may be called outside of `generate`. Handle most use cases by creating `cache_position` on the fly
-        #   (this alternative is not as robust as calling `generate` and letting it create `cache_position`)
-        elif cache_position is None:
-            past_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
-            cache_position = torch.arange(past_length, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
+    #     # 1. Handle BC:
+    #     model_inputs = {}
+    #     # - some models don't have `Cache` support (which implies they don't expect `cache_position` in `forward`)
+    #     if self._supports_cache_class:
+    #         model_inputs["cache_position"] = cache_position
+    #     # - `cache_position` was not a mandatory input in `prepare_inputs_for_generation` for those models, and this
+    #     #   function may be called outside of `generate`. Handle most use cases by creating `cache_position` on the fly
+    #     #   (this alternative is not as robust as calling `generate` and letting it create `cache_position`)
+    #     elif cache_position is None:
+    #         past_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+    #         cache_position = torch.arange(past_length, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
 
-        # 2. Generic cache-dependent input preparation
-        # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
-        # Exception 1: when passing input_embeds, input_ids may be missing entries
-        # Exception 2: some generation methods do special slicing of input_ids, so we don't need to do it here
-        # Exception 3: with synced GPUs cache_position may go out of bounds, but we only want dummy token in that case
-        if past_key_values is not None:
-            model_inputs["past_key_values"] = past_key_values
-            if inputs_embeds is not None or cache_position[-1] >= input_ids.shape[1]:  # Exception 1 or Exception 3
-                input_ids = input_ids[:, -cache_position.shape[0] :]
-            elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
-                input_ids = input_ids[:, cache_position]
+    #     # 2. Generic cache-dependent input preparation
+    #     # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
+    #     # Exception 1: when passing input_embeds, input_ids may be missing entries
+    #     # Exception 2: some generation methods do special slicing of input_ids, so we don't need to do it here
+    #     # Exception 3: with synced GPUs cache_position may go out of bounds, but we only want dummy token in that case
+    #     if past_key_values is not None:
+    #         model_inputs["past_key_values"] = past_key_values
+    #         if inputs_embeds is not None or cache_position[-1] >= input_ids.shape[1]:  # Exception 1 or Exception 3
+    #             input_ids = input_ids[:, -cache_position.shape[0] :]
+    #         elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
+    #             input_ids = input_ids[:, cache_position]
 
-        # 3. Prepare base model inputs
-        input_ids_key = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if not self.config.is_encoder_decoder:
-            if inputs_embeds is not None and cache_position[0] == 0:
-                model_inputs[input_ids_key] = None
-                model_inputs["inputs_embeds"] = inputs_embeds
-            else:
-                # `clone` calls in this function ensure a consistent stride. See #32227
-                model_inputs[input_ids_key] = input_ids.clone(memory_format=torch.contiguous_format)
-                model_inputs["inputs_embeds"] = None
-        else:
-            model_inputs[input_ids_key] = input_ids.clone(memory_format=torch.contiguous_format)
+    #     # 3. Prepare base model inputs
+    #     input_ids_key = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+    #     # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+    #     if not self.config.is_encoder_decoder:
+    #         if inputs_embeds is not None and cache_position[0] == 0:
+    #             model_inputs[input_ids_key] = None
+    #             model_inputs["inputs_embeds"] = inputs_embeds
+    #         else:
+    #             # `clone` calls in this function ensure a consistent stride. See #32227
+    #             model_inputs[input_ids_key] = input_ids.clone(memory_format=torch.contiguous_format)
+    #             model_inputs["inputs_embeds"] = None
+    #     else:
+    #         model_inputs[input_ids_key] = input_ids.clone(memory_format=torch.contiguous_format)
 
-        # 4. Create missing `position_ids` on the fly
-        if (
-            attention_mask is not None
-            and kwargs.get("position_ids") is None
-            and "position_ids" in set(inspect.signature(self.forward).parameters.keys())
-        ):
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            kwargs["position_ids"] = position_ids  # placed in kwargs for further processing (see below)
+    #     # 4. Create missing `position_ids` on the fly
+    #     if (attention_mask is not None and kwargs.get("position_ids") is None and "position_ids" in set(inspect.signature(self.forward).parameters.keys())):
+    #         position_ids = attention_mask.long().cumsum(-1) - 1
+    #         position_ids.masked_fill_(attention_mask == 0, 1)
+    #         kwargs["position_ids"] = position_ids  # placed in kwargs for further processing (see below)
 
-        # 5. Slice model inputs if it's an input that should have the same length as `input_ids`
-        for model_input_name in ["position_ids", "token_type_ids"]:
-            model_input = kwargs.get(model_input_name)
-            if model_input is not None:
-                if past_key_values:
-                    model_input = model_input[:, -input_ids.shape[1] :]
-                    model_input = model_input.clone(memory_format=torch.contiguous_format)
-                model_inputs[model_input_name] = model_input
+    #     # 5. Slice model inputs if it's an input that should have the same length as `input_ids`
+    #     for model_input_name in ["position_ids", "token_type_ids"]:
+    #         model_input = kwargs.get(model_input_name)
+    #         if model_input is not None:
+    #             if past_key_values:
+    #                 model_input = model_input[:, -input_ids.shape[1] :]
+    #                 model_input = model_input.clone(memory_format=torch.contiguous_format)
+    #             model_inputs[model_input_name] = model_input
 
-        # 6. Create 4D attention mask is we are using a `StaticCache` (important for performant compiled forward pass)
-        if isinstance(past_key_values, StaticCache) and attention_mask.ndim == 2:
-            if model_inputs["inputs_embeds"] is not None:
-                batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
-                device = model_inputs["inputs_embeds"].device
-            else:
-                batch_size, sequence_length = model_inputs[input_ids_key].shape
-                device = model_inputs[input_ids_key].device
+    #     # 6. Create 4D attention mask is we are using a `StaticCache` (important for performant compiled forward pass)
+    #     if isinstance(past_key_values, StaticCache) and attention_mask.ndim == 2:
+    #         if model_inputs["inputs_embeds"] is not None:
+    #             batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
+    #             device = model_inputs["inputs_embeds"].device
+    #         else:
+    #             batch_size, sequence_length = model_inputs[input_ids_key].shape
+    #             device = model_inputs[input_ids_key].device
 
-            # Create the causal mask with fixed shape in advance, to reduce recompilations. If the function to create
-            # the 4D causal mask exists, it should be present in the base model (XXXModel class).
-            base_model = getattr(self, self.base_model_prefix, None)
-            if base_model is None:
-                causal_mask_creation_function = getattr(
-                    self, "_prepare_4d_causal_attention_mask_with_cache_position", None
-                )
-            else:
-                causal_mask_creation_function = getattr(
-                    base_model, "_prepare_4d_causal_attention_mask_with_cache_position", None
-                )
-            if causal_mask_creation_function is None:
-                logger.warning_once(
-                    f"{self.__class__.__name__} has no `_prepare_4d_causal_attention_mask_with_cache_position` method "
-                    "defined in its base modeling class. Compiled forward passes will be sub-optimal. If you're "
-                    "writing code, see Llama for an example implementation. If you're a user, please report this "
-                    "issue on GitHub."
-                )
-            else:
-                attention_mask = causal_mask_creation_function(
-                    attention_mask,
-                    sequence_length=sequence_length,
-                    target_length=past_key_values.get_max_cache_shape(),
-                    dtype=self.dtype,
-                    device=device,
-                    cache_position=cache_position,
-                    batch_size=batch_size,
-                    config=self.config,
-                    past_key_values=past_key_values,
-                )
-        if attention_mask is not None:
-            model_inputs["attention_mask"] = attention_mask
+    #         # Create the causal mask with fixed shape in advance, to reduce recompilations. If the function to create
+    #         # the 4D causal mask exists, it should be present in the base model (XXXModel class).
+    #         base_model = getattr(self, self.base_model_prefix, None)
+    #         if base_model is None:
+    #             causal_mask_creation_function = getattr(
+    #                 self, "_prepare_4d_causal_attention_mask_with_cache_position", None
+    #             )
+    #         else:
+    #             causal_mask_creation_function = getattr(
+    #                 base_model, "_prepare_4d_causal_attention_mask_with_cache_position", None
+    #             )
+    #         if causal_mask_creation_function is None:
+    #             logger.warning_once(
+    #                 f"{self.__class__.__name__} has no `_prepare_4d_causal_attention_mask_with_cache_position` method "
+    #                 "defined in its base modeling class. Compiled forward passes will be sub-optimal. If you're "
+    #                 "writing code, see Llama for an example implementation. If you're a user, please report this "
+    #                 "issue on GitHub."
+    #             )
+    #         else:
+    #             attention_mask = causal_mask_creation_function(
+    #                 attention_mask,
+    #                 sequence_length=sequence_length,
+    #                 target_length=past_key_values.get_max_cache_shape(),
+    #                 dtype=self.dtype,
+    #                 device=device,
+    #                 cache_position=cache_position,
+    #                 batch_size=batch_size,
+    #                 config=self.config,
+    #                 past_key_values=past_key_values,
+    #             )
+    #     if attention_mask is not None:
+    #         model_inputs["attention_mask"] = attention_mask
 
-        # 7. Forward ALL kwargs that are uninitialized (e.g. `use_cache`).
-        for key, value in kwargs.items():
-            if key not in model_inputs:
-                model_inputs[key] = value
+    #     # 7. Forward ALL kwargs that are uninitialized (e.g. `use_cache`).
+    #     for key, value in kwargs.items():
+    #         if key not in model_inputs:
+    #             model_inputs[key] = value
 
-        # 8. Remove unexpected `generate` inputs (TODO @joao: fix trainer and examples)
-        model_inputs.pop("labels", None)
-        return model_inputs
+    #     # 8. Remove unexpected `generate` inputs (TODO @joao: fix trainer and examples)
+    #     model_inputs.pop("labels", None)
+    #     return model_inputs
 
 @add_start_docstrings(
     """
