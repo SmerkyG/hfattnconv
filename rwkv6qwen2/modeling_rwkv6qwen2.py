@@ -626,7 +626,6 @@ class RWKV6Qwen2Model(RWKV6Qwen2PreTrainedModel):
         #return_legacy_cache = False
         if use_cache and not isinstance(past_key_values, RWKV6State):
             #return_legacy_cache = True
-            print("creating past_key_values", past_key_values)
             past_key_values = RWKV6State()
             # if past_key_values is None:
             #     past_key_values = DynamicCache()
