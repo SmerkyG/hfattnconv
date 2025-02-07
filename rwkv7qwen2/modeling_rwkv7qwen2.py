@@ -50,402 +50,8 @@ from transformers.utils import (
 )
 from .configuration_rwkv7qwen2 import RWKV7Qwen2Config
 
-# MIT License
-
-# Copyright (c) 2024 Songlin Yang
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-
-# Copyright (c) 2024, Johan Sokrates Wind
-
-import torch as th
-import triton
-import triton.language as tl
-
-@triton.jit
-def IND3(a,b,c,nb,nc):
-    return (a*nb+b)*nc+c
-@triton.jit
-def IND4(a,b,c,d,nb,nc,nd):
-    return ((a*nb+b)*nc+c)*nd+d
-@triton.jit
-def IND5(a,b,c,d,e,nb,nc,nd,ne):
-    return (((a*nb+b)*nc+c)*nd+d)*ne+e
-
-@triton.jit
-def _prod(a,b): return a*b
-
-# inv(I-A) where A is a strictly lower triangular nxn matrix
-@triton.jit
-def tri_minv(A, n:tl.constexpr, prec:tl.constexpr):
-    i = tl.arange(0,n)
-    prod = (i[None,:]==i[:,None]).to(tl.float32)
-    for j in range(n-1):
-        prod += tl_dot(prec, prod, (A*((i[None,:]==j)*(i[:,None]>i[None,:]))).trans())
-    return prod.trans()
-
-@triton.autotune(configs=[triton.Config({'dC': dC}, num_stages=1) for dC in [16,32,64]], key=['T','H','C','dT','prec'])
-@triton.jit
-def fw_attn_triton(w_,q_,k_,v_,a_,b_, s0_,y_,s_,sT_, wq_,wa_,kwi_,bwi_,fw_, B:tl.constexpr,T:tl.constexpr,H:tl.constexpr,C:tl.constexpr,dT:tl.constexpr, prec:tl.constexpr, dC:tl.constexpr):
-    tl.static_assert(C%dC == 0)
-    bi = tl.program_id(1)
-    hi = tl.program_id(0)
-    for i0 in range(0,C,dC):
-        i = i0+tl.arange(0,dC)[None,:]
-        for j0 in range(0,C,dC):
-            j = j0+tl.arange(0,dC)[None,:]
-            state = tl.load(s0_+IND4(bi,hi,i.trans(),j, H,C,C)).to(tl.float32)
-            tl.store(s_+IND5(bi,hi,0,i.trans(),j, H,T//dT,C,C), state.to(tl.float32))
-
-    for t0 in range(T//dT):
-        dt = tl.arange(0,dT)[:,None]
-        t = t0*dT+dt
-        tl.debug_barrier()
-        for j0 in range(0,C,dC):
-            j = j0+tl.arange(0,dC)[None,:]
-            sw = tl.load(w_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-            sq = tl.load(q_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-            sk = tl.load(k_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-            sa = tl.load(a_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-            sb = tl.load(b_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-
-            w = (-sw.exp()).exp()
-            fw = tl.reduce(w, 0, _prod, keep_dims=True)
-            incl_pref = tl.cumprod(w,axis=0)
-            non_incl_pref = incl_pref / w
-            inv_incl_pref = 1 / incl_pref
-
-            wq = sq * incl_pref
-            wa = sa * non_incl_pref
-            kwi = sk * inv_incl_pref
-            bwi = sb * inv_incl_pref
-
-            tl.store(wq_+IND4(bi,hi,dt,j, H,dT,C), wq.to(tl.float32))
-            tl.store(wa_+IND4(bi,hi,dt,j, H,dT,C), wa.to(tl.float32))
-            tl.store(kwi_+IND4(bi,hi,dt,j, H,dT,C), kwi.to(tl.float32))
-            tl.store(bwi_+IND4(bi,hi,dt,j, H,dT,C), bwi.to(tl.float32))
-            tl.store(fw_+IND3(bi,hi,j, H,C), fw.to(tl.float32))
-        tl.debug_barrier()
-
-        ab = tl.zeros((dT,dT), tl.float32)
-        ak = tl.zeros((dT,dT), tl.float32)
-        qb = tl.zeros((dT,dT), tl.float32)
-        qk = tl.zeros((dT,dT), tl.float32)
-        for j0 in range(0,C,dC):
-            j = j0+tl.arange(0,dC)[None,:]
-
-            wa = tl.load(wa_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-            wq = tl.load(wq_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-            bwi = tl.load(bwi_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-            kwi = tl.load(kwi_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-
-            sa = tl.load(a_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-            sb = tl.load(b_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-
-            ab += tl_dot(prec, wa, bwi.trans())
-            ak += tl_dot(prec, wa, kwi.trans())
-            qb += tl_dot(prec, wq, bwi.trans())
-            qk += tl_dot(prec, wq, kwi.trans())
-
-        mask1 = (t > t.trans())
-        mask2 = (t >= t.trans())
-        ab *= mask1
-        ak *= mask1
-        qb *= mask2
-        qk *= mask2
-
-        ab_inv = tri_minv(ab, dT, prec)
-
-        for i0 in range(0,C,dC):
-            i = i0+tl.arange(0,dC)[None,:]
-            sv = tl.load(v_+IND4(bi,t,hi,i, T,H,C)).to(tl.float32)
-
-            wa_state = tl.zeros((dT,dC), tl.float32)
-            wq_state = tl.zeros((dT,dC), tl.float32)
-            for j0 in range(0,C,dC):
-                j = j0+tl.arange(0,dC)[None,:]
-                state = tl.load(s_+IND5(bi,hi,t0,i.trans(),j, H,T//dT,C,C)).to(tl.float32)
-                wa = tl.load(wa_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-                wq = tl.load(wq_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-                wa_state += tl_dot(prec, wa, state.trans())
-                wq_state += tl_dot(prec, wq, state.trans())
-
-            ab_u = tl_dot(prec, ak, sv) + wa_state
-            u = tl_dot(prec, ab_inv, ab_u)
-            yy = tl_dot(prec, qk, sv) + tl_dot(prec, qb, u) + wq_state
-            tl.store(y_+IND4(bi,t,hi,i, T,H,C), yy.to(tl.bfloat16))
-
-            for j0 in range(0,C,dC):
-                j = j0+tl.arange(0,dC)[None,:]
-                state = tl.load(s_+IND5(bi,hi,t0,i.trans(),j, H,T//dT,C,C)).to(tl.float32)
-                kwi = tl.load(kwi_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-                bwi = tl.load(bwi_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-                fw = tl.load(fw_+IND3(bi,hi,j, H,C))
-
-                state = state * fw + tl_dot(prec, sv.trans(), kwi*fw) + tl_dot(prec, u.trans(), bwi*fw)
-
-                if t0+1 < T//dT:
-                    tl.store(s_+IND5(bi,hi,t0+1,i.trans(),j, H,T//dT,C,C), state.to(tl.float32))
-                else:
-                    tl.store(sT_+IND4(bi,hi,i.trans(),j, H,C,C), state.to(tl.bfloat16))
-
-
-@triton.autotune(configs=[triton.Config({'dC': dC}, num_stages=1) for dC in [16,32,64]], key=['T','H','C','dT','prec'])
-@triton.jit
-def bw_attn_triton(w_,q_,k_,v_,a_,b_, dy_,s_,dsT_,ds_, dw_,dq_,dk_,dv_,da_,db_,ds0_, wq_,wa_,kwi_,bwi_,fw_,u_,dab_u_, B:tl.constexpr,T:tl.constexpr,H:tl.constexpr,C:tl.constexpr,dT:tl.constexpr, prec:tl.constexpr, dC:tl.constexpr):
-    tl.static_assert(C%dC == 0)
-    bi = tl.program_id(1)
-    hi = tl.program_id(0)
-
-    for i0 in range(0,C,dC):
-        i = i0+tl.arange(0,dC)[None,:]
-        for j0 in range(0,C,dC):
-            j = j0+tl.arange(0,dC)[None,:]
-            dstate = tl.load(dsT_+IND4(bi,hi,i.trans(),j, H,C,C)).to(tl.float32)
-            tl.store(ds_+IND4(bi,hi,i.trans(),j, H,C,C), dstate.to(tl.float32))
-
-    for t0 in range(T//dT-1,-1,-1):
-        dt = tl.arange(0,dT)[:,None]
-        t = t0*dT+dt
-        tl.debug_barrier()
-        for j0 in range(0,C,dC):
-            j = j0+tl.arange(0,dC)[None,:]
-            sw = tl.load(w_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-            sq = tl.load(q_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-            sk = tl.load(k_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-            sa = tl.load(a_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-            sb = tl.load(b_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-
-            w = (-sw.exp()).exp()
-            fw = tl.reduce(w, 0, _prod, keep_dims=True)
-            incl_pref = tl.cumprod(w,axis=0)
-            non_incl_pref = incl_pref / w
-            inv_incl_pref = 1 / incl_pref
-
-            wq = sq * incl_pref
-            wa = sa * non_incl_pref
-            kwi = sk * inv_incl_pref
-            bwi = sb * inv_incl_pref
-
-            tl.store(wq_+IND4(bi,hi,dt,j, H,dT,C), wq.to(tl.float32))
-            tl.store(wa_+IND4(bi,hi,dt,j, H,dT,C), wa.to(tl.float32))
-            tl.store(kwi_+IND4(bi,hi,dt,j, H,dT,C), kwi.to(tl.float32))
-            tl.store(bwi_+IND4(bi,hi,dt,j, H,dT,C), bwi.to(tl.float32))
-            tl.store(fw_+IND3(bi,hi,j, H,C), fw.to(tl.float32))
-        tl.debug_barrier()
-
-        ab = tl.zeros((dT,dT), tl.float32)
-        ak = tl.zeros((dT,dT), tl.float32)
-        qb = tl.zeros((dT,dT), tl.float32)
-        qk = tl.zeros((dT,dT), tl.float32)
-        for j0 in range(0,C,dC):
-            j = j0+tl.arange(0,dC)[None,:]
-
-            wa = tl.load(wa_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-            wq = tl.load(wq_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-            bwi = tl.load(bwi_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-            kwi = tl.load(kwi_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-
-            sa = tl.load(a_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-            sb = tl.load(b_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-
-            ab += tl_dot(prec, wa, bwi.trans())
-            ak += tl_dot(prec, wa, kwi.trans())
-            qb += tl_dot(prec, wq, bwi.trans())
-            qk += tl_dot(prec, wq, kwi.trans())
-
-        mask1 = (t > t.trans())
-        mask2 = (t >= t.trans())
-        ab *= mask1
-        ak *= mask1
-        qb *= mask2
-        qk *= mask2
-
-        ab_inv = tri_minv(ab, dT, prec)
-
-        dab = tl.zeros((dT,dT), tl.float32)
-        dak = tl.zeros((dT,dT), tl.float32)
-        dqb = tl.zeros((dT,dT), tl.float32)
-        dqk = tl.zeros((dT,dT), tl.float32)
-
-        tl.debug_barrier()
-        for i0 in range(0,C,dC):
-            i = i0+tl.arange(0,dC)[None,:]
-            wa_state = tl.zeros((dT,dC), tl.float32)
-            bwi_dw_dstate = tl.zeros((dT,dC), tl.float32)
-            kwi_dw_dstate = tl.zeros((dT,dC), tl.float32)
-            for j0 in range(0,C,dC):
-                j = j0+tl.arange(0,dC)[None,:]
-                state = tl.load(s_+IND5(bi,hi,t0,i.trans(),j, H,T//dT,C,C)).to(tl.float32)
-                dstate = tl.load(ds_+IND4(bi,hi,i.trans(),j, H,C,C)).to(tl.float32)
-                wa = tl.load(wa_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-                bwi = tl.load(bwi_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-                kwi = tl.load(kwi_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-                fw = tl.load(fw_+IND3(bi,hi,j, H,C))
-
-                wa_state += tl_dot(prec, wa, state.trans())
-                bwi_dw_dstate += tl_dot(prec, bwi*fw, dstate.trans())
-                kwi_dw_dstate += tl_dot(prec, kwi*fw, dstate.trans())
-
-            sv = tl.load(v_+IND4(bi,t,hi,i, T,H,C)).to(tl.float32)
-            sdy = tl.load(dy_+IND4(bi,t,hi,i, T,H,C)).to(tl.float32)
-
-            ab_u = tl_dot(prec, ak, sv) + wa_state
-            u = tl_dot(prec, ab_inv, ab_u)
-            du = tl_dot(prec, qb.trans(), sdy) + bwi_dw_dstate
-            dab_u = tl_dot(prec, ab_inv.trans(), du)
-
-            tl.store(u_+IND4(bi,hi,dt,i, H,dT,C), u.to(tl.float32))
-            tl.store(dab_u_+IND4(bi,hi,dt,i, H,dT,C), dab_u.to(tl.float32))
-
-            dv = tl_dot(prec, qk.trans(), sdy) + kwi_dw_dstate + tl_dot(prec, ak.trans(), dab_u)
-            tl.store(dv_+IND4(bi,t,hi,i, T,H,C), dv.to(tl.bfloat16))
-
-            dab += tl_dot(prec, dab_u, u.trans()) * mask1
-            dak += tl_dot(prec, dab_u, sv.trans()) * mask1
-            dqb += tl_dot(prec, sdy, u.trans()) * mask2
-            dqk += tl_dot(prec, sdy, sv.trans()) * mask2
-        tl.debug_barrier()
-
-        for j0 in range(0,C,dC):
-            j = j0+tl.arange(0,dC)[None,:]
-
-            dy_state = tl.zeros((dT,dC), tl.float32)
-            dab_u_state = tl.zeros((dT,dC), tl.float32)
-            fw_u_dstate = tl.zeros((dT,dC), tl.float32)
-            fw_v_dstate = tl.zeros((dT,dC), tl.float32)
-            state_dstate = tl.zeros((1,dC), tl.float32)
-
-            fw = tl.load(fw_+IND3(bi,hi,j, H,C))
-            wa = tl.load(wa_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-            wq = tl.load(wq_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-            for i0 in range(0,C,dC):
-                i = i0+tl.arange(0,dC)[None,:]
-
-                u = tl.load(u_+IND4(bi,hi,dt,i, H,dT,C)).to(tl.float32)
-                dab_u = tl.load(dab_u_+IND4(bi,hi,dt,i, H,dT,C)).to(tl.float32)
-                sv = tl.load(v_+IND4(bi,t,hi,i, T,H,C)).to(tl.float32)
-                sdy = tl.load(dy_+IND4(bi,t,hi,i, T,H,C)).to(tl.float32)
-
-                state = tl.load(s_+IND5(bi,hi,t0,i.trans(),j, H,T//dT,C,C)).to(tl.float32)
-                tl.debug_barrier()
-                dstate = tl.load(ds_+IND4(bi,hi,i.trans(),j, H,C,C)).to(tl.float32)
-                tl.debug_barrier()
-
-                dab_u_state += tl_dot(prec, dab_u, state)
-                fw_u_dstate += fw * tl_dot(prec, u, dstate)
-                fw_v_dstate += fw * tl_dot(prec, sv, dstate)
-                dy_state += tl_dot(prec, sdy, state)
-
-                state_dstate += tl.sum(state*dstate, axis=0,keep_dims=True)
-
-                dstate = dstate * fw + tl_dot(prec, sdy.trans(), wq) + tl_dot(prec, dab_u.trans(), wa)
-                if t0 > 0:
-                    tl.store(ds_+IND4(bi,hi,i.trans(),j, H,C,C), dstate.to(tl.float32))
-                else:
-                    tl.store(ds0_+IND4(bi,hi,i.trans(),j, H,C,C), dstate.to(tl.bfloat16))
-
-            sw = tl.load(w_+IND4(bi,t,hi,j, T,H,C)).to(tl.float32)
-            w = (-sw.exp()).exp()
-            incl_pref = tl.cumprod(w,axis=0)
-            non_incl_pref = incl_pref / w
-            inv_incl_pref = 1 / incl_pref
-
-            bwi = tl.load(bwi_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-            kwi = tl.load(kwi_+IND4(bi,hi,dt,j, H,dT,C)).to(tl.float32)
-
-            da = non_incl_pref * (tl_dot(prec, dab, bwi) + tl_dot(prec, dak, kwi) + dab_u_state)
-            tl.store(da_+IND4(bi,t,hi,j, T,H,C), da.to(tl.bfloat16))
-
-            dq = incl_pref * (tl_dot(prec, dqb, bwi) + tl_dot(prec, dqk, kwi) + dy_state)
-            tl.store(dq_+IND4(bi,t,hi,j, T,H,C), dq.to(tl.bfloat16))
-
-            db = inv_incl_pref * (tl_dot(prec, dab.trans(), wa) + tl_dot(prec, dqb.trans(), wq) + fw_u_dstate)
-            tl.store(db_+IND4(bi,t,hi,j, T,H,C), db.to(tl.bfloat16))
-
-            dk = inv_incl_pref * (tl_dot(prec, dak.trans(), wa) + tl_dot(prec, dqk.trans(), wq) + fw_v_dstate)
-            tl.store(dk_+IND4(bi,t,hi,j, T,H,C), dk.to(tl.bfloat16))
-
-            dw0 = fw * state_dstate
-            for k in range(t0*dT,t0*dT+dT):
-                lmask = (t<k).trans()
-                A = (tl_dot(prec, dab*lmask, bwi) + tl_dot(prec, dak*lmask, kwi)) * wa * (t>k)
-                A += (tl_dot(prec, dqb*lmask, bwi) + tl_dot(prec, dqk*lmask, kwi)) * wq * (t>=k)
-                A += (fw_v_dstate*kwi + fw_u_dstate*bwi) * (t<k)
-                A += dab_u_state*wa * (t>k) + dy_state*wq * (t>=k)
-                dw = tl.sum(A, axis=0,keep_dims=True) + dw0
-
-                wk = tl.load(w_+IND4(bi,k,hi,j, T,H,C)).to(tl.float32)
-                dw *= -wk.exp()
-                tl.store(dw_+IND4(bi,k,hi,j, T,H,C), dw.to(tl.bfloat16))
-
-
-
-class TritonRWKV7(th.autograd.Function):
-    @staticmethod
-    def forward(ctx, w,q,k,v,a,b,s0, dot_prec):
-        K = 16
-        B,T,H,C = w.shape
-        assert T%K == 0
-        assert C%16 == 0
-        s0 = th.zeros(B,H,C,C, dtype=w.dtype,device=w.device) if s0 is None else s0
-        y = th.empty_like(v)
-        sT = th.empty_like(s0)
-        s = th.zeros(B,H,T//K,C,C, dtype=th.float32,device=w.device)
-        wq,wa,kwi,bwi = [th.empty(B,H,K,C, dtype=th.float32,device=w.device) for i in range(4)]
-        fw = th.empty(B,H,C, dtype=th.float32,device=w.device)
-        fw_attn_triton[(H,B)](w,q,k,v,a,b, s0,y,s,sT, wq,wa,kwi,bwi,fw, B,T,H,C,K, dot_prec)
-        ctx.dot_prec = dot_prec
-        ctx.save_for_backward(w,q,k,v,a,b,s)
-        return y, sT
-    @staticmethod
-    def backward(ctx, dy, dsT):
-        K = 16
-        w,q,k,v,a,b,s = ctx.saved_tensors
-        B,T,H,C = w.shape
-        dw,dq,dk,dv,da,db,ds0 = [th.empty_like(x) for x in [w,q,k,v,a,b,dsT]]
-        fw = th.empty(B,H,C, dtype=th.float32,device=w.device)
-        ds = th.empty(B,H,C,C, dtype=th.float32,device=w.device)
-        wq,wa,kwi,bwi,u,dab_u = [th.empty(B,H,K,C, dtype=th.float32,device=w.device) for i in range(6)]
-        bw_attn_triton[(H,B)](w,q,k,v,a,b, dy,s,dsT,ds, dw,dq,dk,dv,da,db,ds0, wq,wa,kwi,bwi,fw,u,dab_u, B,T,H,C,K, ctx.dot_prec)
-        return dw,dq,dk,dv,da,db,ds0,None
-
-@triton.jit
-def tl_dot(prec:tl.constexpr, a, b):
-    if prec == 'fp32':
-        return tl.dot(a.to(tl.float32),b.trans().to(tl.float32).trans(), allow_tf32=False)
-    elif prec == 'tf32':
-        return tl.dot(a.to(tl.float32),b.trans().to(tl.float32).trans(), allow_tf32=True)
-    elif prec == 'bf16':
-        return tl.dot(a.to(tl.bfloat16),b.trans().to(tl.bfloat16).trans(), allow_tf32=True)
-    else:
-        tl.static_assert(False)
-
-def attn_triton_bighead(r,w,k,v,a,b, s0, HEAD_DIM, dot_prec = 'fp32'):
-    B,T,HC = w.shape
-    C = HEAD_DIM
-    H = HC//C
-    r,w,k,v,a,b = [i.view(B,T,H,C) for i in [r,w,k,v,a,b]]
-    x_out, s_out = TritonRWKV7.apply(w,r,k,v,a,b,s0,dot_prec)
-    return x_out.view(B,T,HC), s_out
-
 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2MLP, Qwen2RMSNorm
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 logger = logging.get_logger(__name__)
 
@@ -599,13 +205,125 @@ class RWKV7State(Cache):
     #         self.value_cache[layer_idx] = self.value_cache[layer_idx][indices, ...]
 
 try:
-    #from fla.ops.gla.chunk import chunk_gla
-    from fla.ops.gla.fused_recurrent import fused_recurrent_gla
+    from fla.ops.rwkv7.chunk import chunk_rwkv7
+    from fla.ops.rwkv7.fused_recurrent import fused_recurrent_rwkv7
 except ImportError:
     print("Required module is not installed. Please install it using the following commands:")
     print("pip install -U git+https://github.com/fla-org/flash-linear-attention")
     print("Additionally, ensure you have at least version 2.2.0 of Triton installed:")
     print("pip install triton>=2.2.0")
+
+class Qwen2RotaryEmbedding(nn.Module):
+    def __init__(self, config: RWKV7Qwen2Config, device=None):
+        super().__init__()
+        # BC: "rope_type" was originally "type"
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def _dynamic_frequency_update(self, position_ids, device):
+        """
+        dynamic RoPE layers should recompute `inv_freq` in the following situations:
+        1 - growing beyond the cached sequence length (allow scaling)
+        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        """
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:  # growth
+            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=seq_len)
+            self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: may break with compilation
+            self.max_seq_len_cached = seq_len
+
+        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:  # reset
+            # This .to() is needed if the model has been moved to a device after being initialized (because
+            # the buffer is automatically moved, but not the original copy)
+            self.original_inv_freq = self.original_inv_freq.to(device)
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+
+        # Core RoPE block
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+    
+def generate_rotary_embedding(max_seqlen:int, dim:int, theta:float = 10000.0, scale:float = 1):
+    #inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float).to(device) / dim))
+
+    angular_velocity = theta ** -(torch.arange(0, dim, 2, dtype=torch.float) / dim) / scale # frequencies from 1.0 ... 1/theta
+    angles = torch.outer(torch.arange(max_seqlen), angular_velocity)
+    # Different from paper, but it uses a different permutation in order to obtain the same calculation
+    emb = torch.cat((angles, angles), dim=-1)
+    return torch.stack([emb.cos(), emb.sin()], dim=0)
+    #return torch.polar(torch.ones_like(angles), angles)
+
+# Copied from transformers.models.llama.modeling_llama.rotate_half
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+# # Copied from transformers.models.mixtral.modeling_mixtral.apply_rotary_pos_emb
+# def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim:int=1):
+#     B, L = q.size(0), q.size(-2)
+#     cos = cos[:L].unsqueeze(0).expand(B,L,-1).unsqueeze(unsqueeze_dim)
+#     sin = sin[:L].unsqueeze(0).expand(B,L,-1).unsqueeze(unsqueeze_dim)
+#     q_embed = (q * cos) + (rotate_half(q) * sin)
+#     k_embed = (k * cos) + (rotate_half(k) * sin)
+#     return q_embed, k_embed
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 class RWKV7Attention(nn.Module):
     def __init__(self, config, layer_idx: Optional[int] = None):
@@ -635,12 +353,12 @@ class RWKV7Attention(nn.Module):
         lora_rank_value_residual_mix = config.lora_rank_value_residual_mix or calc_lora_rank(0.5, 1.3)
         lora_rank_gate = config.lora_rank_gate or calc_lora_rank(0.8, 0.6)
 
-        self.x_r = nn.Parameter(torch.empty(1,1,C))
-        self.x_w = nn.Parameter(torch.empty(1,1,C))
-        self.x_k = nn.Parameter(torch.empty(1,1,C))
-        self.x_v = nn.Parameter(torch.empty(1,1,C))
-        self.x_a = nn.Parameter(torch.empty(1,1,C))
-        self.x_g = nn.Parameter(torch.empty(1,1,C))
+        # self.x_r = nn.Parameter(torch.empty(1,1,C))
+        # self.x_w = nn.Parameter(torch.empty(1,1,C))
+        # self.x_k = nn.Parameter(torch.empty(1,1,C))
+        # self.x_v = nn.Parameter(torch.empty(1,1,C))
+        # self.x_a = nn.Parameter(torch.empty(1,1,C))
+        # self.x_g = nn.Parameter(torch.empty(1,1,C))
 
         self.w0 = nn.Parameter(torch.empty(1,1,C))
         self.w1 = nn.Parameter(torch.empty(C, lora_rank_decay))
@@ -650,10 +368,10 @@ class RWKV7Attention(nn.Module):
         self.a1 = nn.Parameter(torch.empty(C, lora_rank_iclr))
         self.a2 = nn.Parameter(torch.empty(lora_rank_iclr, C))
 
-        if layer_idx > 0:
-            self.v0 = nn.Parameter(torch.empty(1,1,C))
-            self.v1 = nn.Parameter(torch.empty(C, lora_rank_value_residual_mix))
-            self.v2 = nn.Parameter(torch.empty(lora_rank_value_residual_mix, C))
+        #if layer_idx > 0:
+        self.v0 = nn.Parameter(torch.empty(1,1,C))
+        self.v1 = nn.Parameter(torch.empty(C, lora_rank_value_residual_mix))
+        self.v2 = nn.Parameter(torch.empty(lora_rank_value_residual_mix, C))
 
         self.g1 = nn.Parameter(torch.empty(C, lora_rank_gate))
         self.g2 = nn.Parameter(torch.empty(lora_rank_gate, C))
@@ -662,11 +380,6 @@ class RWKV7Attention(nn.Module):
         self.k_a = nn.Parameter(torch.empty(1,1,C))
         self.r_k = nn.Parameter(torch.empty(H,N))
 
-        # self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-        # self.receptance = nn.Linear(C, self.num_heads * self.head_dim, bias=config.attention_bias)
-        # self.key = nn.Linear(C, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        # self.value = nn.Linear(C, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        # self.output = nn.Linear(self.num_heads * self.head_dim, C, bias=getattr(config, 'attention_output_bias', config.attention_bias))
         self.ln_x = nn.GroupNorm(H, C, eps=self.head_dim * 1e-5)
 
     def forward(
@@ -675,11 +388,11 @@ class RWKV7Attention(nn.Module):
         v_first: Optional[torch.Tensor] = None, 
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[RWKV7State] = None,
+        past_key_values: Optional[RWKV7State] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         output_shift_state = hidden_states[:, -1:].detach().clone()
 
@@ -690,27 +403,39 @@ class RWKV7Attention(nn.Module):
         N = self.head_dim
         q_len = T
 
-        if use_cache and past_key_value is not None and len(past_key_value) > self.layer_idx:
-            input_vk_state, input_shift_state = past_key_value[self.layer_idx]
+        if use_cache and past_key_values is not None and len(past_key_values) > self.layer_idx:
+            input_vk_state, input_shift_state = past_key_values[self.layer_idx]
         else:
             input_vk_state, input_shift_state = torch.zeros(B,H,N,N, dtype=torch.float32,device=x.device), torch.zeros_like(x[:, -1:])
 
-        shifted = torch.cat([input_shift_state, x[:, :-1]], dim=1)
-        xx = shifted - x
+        # shifted = torch.cat([input_shift_state, x[:, :-1]], dim=1)
+        # xx = shifted - x
 
-        xr = x+xx*self.x_r
-        xw = x+xx*self.x_w
-        xk = x+xx*self.x_k
-        xv = x+xx*self.x_v
-        xa = x+xx*self.x_a
-        xg = x+xx*self.x_g
+        # xr = x+xx*self.x_r
+        # xw = x+xx*self.x_w
+        # xk = x+xx*self.x_k
+        # xv = x+xx*self.x_v
+        # xa = x+xx*self.x_a
+        # xg = x+xx*self.x_g
+
+        xr = xw = xk = xv = xa = xg = x
 
         r = self.q_proj(xr)
-        w = torch.tanh(xw @ self.w1) @ self.w2
+        w_lora_result = self.w0 + (torch.tanh(xw @ self.w1) @ self.w2).float()
         k = self.k_proj(xk)
         v = self.v_proj(xv)
         a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2)
         g = torch.sigmoid(xg @ self.g1) @ self.g2
+
+        r = r.view(B,T,-1,N)
+        k = k.view(B,T,-1,N)
+        # r = r.transpose(1,2) # BHTN
+        # k = k.transpose(1,2) # B(kvh)TN
+        cos, sin = position_embeddings
+        # cos, sin = shared.angles.unbind(0)
+        r, k = apply_rotary_pos_emb(r, k, cos, sin, unsqueeze_dim=2)
+        # r = r.transpose(1,2).view(B,T,-1).to(v.dtype)
+        # k = k.transpose(1,2).view(B,T,-1).to(v.dtype)
 
         # repeat k/v heads if n_kv_heads < n_heads
         k = k.view(B, T, -1, 1, self.head_dim).expand(-1, -1, -1, self.num_key_value_groups, -1).reshape(B, T, -1)
@@ -718,33 +443,44 @@ class RWKV7Attention(nn.Module):
         dropout_rate = 0.0 if not self.training else self.attention_dropout
 
         kk = torch.nn.functional.normalize((k * self.k_k).view(B,T,H,-1), dim=-1, p=2.0).view(B,T,-1)
-        k = k * (1 + (a-1) * self.k_a)
+        # k = k * (1 + (a-1) * self.k_a)
+        a = 1 + (a-1) * self.k_a
+        k = k * a
         if self.layer_idx == 0: v_first = v
         else: v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)        
 
-        if T == 1 or not self.training:
-            w = torch.exp(-0.606531 * torch.sigmoid((self.w0 + w).float())) # 0.606531 = exp(-0.5)
-            output_vk_state = input_vk_state
-            for t in range(T):
-                r_, w_, k_, v_, kk_, a_ = r[:,t], w[:,t], k[:,t], v[:,t], kk[:,t], a[:,t]
-                vk = v_.view(B,H,N,1) @ k_.view(B,H,1,N)
-                ab = (-kk_).view(B,H,N,1) @ (kk_*a_).view(B,H,1,N)
-                output_vk_state = output_vk_state * w_.view(B,H,1,N) + output_vk_state @ ab.float() + vk.float()
-                xx[:,t] = (output_vk_state.to(dtype=x.dtype) @ r_.view(B,H,N,1)).view(B,H*N)
-            # FIXME - support fast triton kernel for non-training pre-fill with state in and out
+        xx = x
+        # if T == 1 or not self.training:
+        #     w = torch.exp(-0.606531 * torch.sigmoid(w_lora_result)) # 0.606531 = exp(-0.5)
+        #     output_vk_state = input_vk_state
+        #     for t in range(T):
+        #         r_, w_, k_, v_, kk_, a_ = r[:,t], w[:,t], k[:,t], v[:,t], kk[:,t], a[:,t]
+        #         vk = v_.view(B,H,N,1) @ k_.view(B,H,1,N)
+        #         ab = (-kk_).view(B,H,N,1) @ (kk_*a_).view(B,H,1,N)
+        #         output_vk_state = output_vk_state * w_.view(B,H,1,N) + output_vk_state @ ab.float() + vk.float()
+        #         xx[:,t] = (output_vk_state.to(dtype=x.dtype) @ r_.view(B,H,N,1)).view(B,H*N)
+        #     # FIXME - support fast triton kernel for non-training pre-fill with state in and out
+        # else:
+        # FIXME - can simplify to 
+        # log_w = -math.exp(-0.5) * torch.sigmoid(w_lora_result)
+        log_neglog_w = - 0.5 - torch.nn.functional.softplus(-w_lora_result)
+        log_w = -log_neglog_w.float().exp()
+
+        r,log_w,k,v,kk,a = [i.view(B,T,self.num_heads,-1) for i in [r,log_w,k,v,kk,a]]
+        if self.training:
+            xx, output_vk_state = chunk_rwkv7(r, log_w, k, v, -kk, kk*a, initial_state=input_vk_state, output_final_state=use_cache)
         else:
-            w = -torch.nn.functional.softplus(-(self.w0 + w)) - 0.5
-            xx, output_vk_state = attn_triton_bighead(r, w, k, v, -kk, kk*a, input_vk_state, self.head_dim)
+            xx, output_vk_state = fused_recurrent_rwkv7(r, log_w, k, v, -kk, kk*a, initial_state=input_vk_state, output_final_state=use_cache)
 
         xx = torch.nn.functional.group_norm(xx.view(B*T,H*N), num_groups=H, weight=self.ln_x.weight, bias=self.ln_x.bias, eps = self.ln_x.eps).view(B,T,H*N)
-        xx = xx + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.r_k).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
+        # xx = xx + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.r_k).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
         xx = self.o_proj(xx * g)
 
-        output_final_state = not self.training and use_cache and past_key_value is not None
+        output_final_state = not self.training and use_cache and past_key_values is not None
         if output_final_state:
-            past_key_value.update(output_vk_state, output_shift_state, q_len, self.layer_idx)
+            past_key_values.update(output_vk_state, output_shift_state, q_len, self.layer_idx)
 
-        return xx, v_first, past_key_value
+        return xx, v_first
     
 class RWKV7Qwen2DecoderLayer(nn.Module):
     def __init__(self, config: RWKV7Qwen2Config, layer_idx: int):
@@ -763,45 +499,28 @@ class RWKV7Qwen2DecoderLayer(nn.Module):
         v_first: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None, # unnecessary, but kept here for BC
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # unnecessary, but kept here for BC
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        if "padding_mask" in kwargs:
-            warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. "
-                "Please make sure use `attention_mask` instead.`"
-            )
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
-                `(batch, sequence_length)` where padding elements are indicated by 0.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
-            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-        """
-
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, v_first, present_key_value = self.self_attn(
+        hidden_states, v_first = self.self_attn(
             hidden_states=hidden_states,
             v_first=v_first,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
         )
         hidden_states = residual + hidden_states
 
@@ -815,9 +534,6 @@ class RWKV7Qwen2DecoderLayer(nn.Module):
 
         if output_attentions:
             outputs += (self_attn_weights,)
-
-        if use_cache:
-            outputs += (present_key_value,)
 
         return outputs
 
@@ -1009,31 +725,20 @@ class RWKV7Qwen2Model(RWKV7Qwen2PreTrainedModel):
                 )
                 use_cache = False
 
-        # kept for BC (non `Cache` `past_key_values` inputs)
-        #return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, RWKV7State):
-            #return_legacy_cache = True
-            past_key_values = RWKV7State()
-            # if past_key_values is None:
-            #     past_key_values = DynamicCache()
-            # else:
-            #     past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            #     logger.warning_once(
-            #         "We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and "
-            #         "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "
-            #         "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
-            #     )
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # if cache_position is None:
-        #     past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        #     cache_position = torch.arange(
-        #         past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-        #     )
-        # if position_ids is None:
-        #     position_ids = cache_position.unsqueeze(0)
+        if use_cache and not isinstance(past_key_values, RWKV7State):
+            past_key_values = RWKV7State()
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
 
         # causal_mask = self._update_causal_mask(
         #     attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
@@ -1044,7 +749,8 @@ class RWKV7Qwen2Model(RWKV7Qwen2PreTrainedModel):
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings = None #self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = None
+        #position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1074,7 +780,7 @@ class RWKV7Qwen2Model(RWKV7Qwen2PreTrainedModel):
                     hidden_states,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    past_key_value=past_key_values,
+                    past_key_values=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
@@ -1085,30 +791,23 @@ class RWKV7Qwen2Model(RWKV7Qwen2PreTrainedModel):
             hidden_states = layer_outputs[0]
             v_first = layer_outputs[1]
 
-            i = 2
             if output_attentions:
-                all_self_attns += (layer_outputs[i],)
-                i += 1
+                all_self_attns += (layer_outputs[2],)
 
-            if use_cache:
-                next_decoder_cache = layer_outputs[i]
-                i += 1
-            
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None
         #if return_legacy_cache:
         #    next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(v for v in [hidden_states, past_key_values, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
@@ -1241,121 +940,31 @@ class RWKV7Qwen2ForCausalLM(RWKV7Qwen2PreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
-        """
-        Prepare the model inputs for generation. In includes operations like computing the 4D attention mask or
-        slicing inputs given the existing cache.
+        # only last token for `inputs_ids` if the `past_key_values` is not empty.
+        if past_key_values is not None and len(past_key_values) > 0:
+            input_ids = input_ids[:, -1:]
 
-        See the forward pass in the model documentation for expected arguments (different models might have different
-        requirements for e.g. `past_key_values`). This function should work as is for most LLMs.
-        """
-
-        # 1. Handle BC:
-        model_inputs = {}
-        # - some models don't have `Cache` support (which implies they don't expect `cache_position` in `forward`)
-        if self._supports_cache_class:
-            model_inputs["cache_position"] = cache_position
-        # - `cache_position` was not a mandatory input in `prepare_inputs_for_generation` for those models, and this
-        #   function may be called outside of `generate`. Handle most use cases by creating `cache_position` on the fly
-        #   (this alternative is not as robust as calling `generate` and letting it create `cache_position`)
-        elif cache_position is None:
-            past_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
-            cache_position = torch.arange(past_length, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
-
-        # 2. Generic cache-dependent input preparation
-        # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
-        # Exception 1: when passing input_embeds, input_ids may be missing entries
-        # Exception 2: some generation methods do special slicing of input_ids, so we don't need to do it here
-        # Exception 3: with synced GPUs cache_position may go out of bounds, but we only want dummy token in that case
-        if past_key_values is not None:
-            model_inputs["past_key_values"] = past_key_values
-            if inputs_embeds is not None or cache_position[-1] >= input_ids.shape[1]:  # Exception 1 or Exception 3
-                input_ids = input_ids[:, -cache_position.shape[0] :]
-            elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
-                input_ids = input_ids[:, cache_position]
-
-        # 3. Prepare base model inputs
-        input_ids_key = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+        model_inputs = {
+            'past_key_values': past_key_values,
+            'attention_mask': attention_mask,
+            'cache_position': cache_position,
+        }
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if not self.config.is_encoder_decoder:
-            if inputs_embeds is not None and cache_position[0] == 0:
-                model_inputs[input_ids_key] = None
-                model_inputs["inputs_embeds"] = inputs_embeds
-            else:
-                # `clone` calls in this function ensure a consistent stride. See #32227
-                model_inputs[input_ids_key] = input_ids.clone(memory_format=torch.contiguous_format)
-                model_inputs["inputs_embeds"] = None
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs['inputs_embeds'] = inputs_embeds
         else:
-            model_inputs[input_ids_key] = input_ids.clone(memory_format=torch.contiguous_format)
+            # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
+            # recompiles graphs as the stride of the inputs is a guard.
+            # Ref: https://github.com/huggingface/transformers/pull/29114
+            # TODO: use `next_tokens` directly instead.
+            model_inputs['input_ids'] = input_ids.contiguous()
 
-        # 4. Create missing `position_ids` on the fly
-        if (
-            attention_mask is not None
-            and kwargs.get("position_ids") is None
-            and "position_ids" in set(inspect.signature(self.forward).parameters.keys())
-        ):
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            kwargs["position_ids"] = position_ids  # placed in kwargs for further processing (see below)
-
-        # 5. Slice model inputs if it's an input that should have the same length as `input_ids`
-        for model_input_name in ["position_ids", "token_type_ids"]:
-            model_input = kwargs.get(model_input_name)
-            if model_input is not None:
-                if past_key_values:
-                    model_input = model_input[:, -input_ids.shape[1] :]
-                    model_input = model_input.clone(memory_format=torch.contiguous_format)
-                model_inputs[model_input_name] = model_input
-
-        # 6. Create 4D attention mask is we are using a `StaticCache` (important for performant compiled forward pass)
-        if isinstance(past_key_values, StaticCache) and attention_mask.ndim == 2:
-            if model_inputs["inputs_embeds"] is not None:
-                batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
-                device = model_inputs["inputs_embeds"].device
-            else:
-                batch_size, sequence_length = model_inputs[input_ids_key].shape
-                device = model_inputs[input_ids_key].device
-
-            # Create the causal mask with fixed shape in advance, to reduce recompilations. If the function to create
-            # the 4D causal mask exists, it should be present in the base model (XXXModel class).
-            base_model = getattr(self, self.base_model_prefix, None)
-            if base_model is None:
-                causal_mask_creation_function = getattr(
-                    self, "_prepare_4d_causal_attention_mask_with_cache_position", None
-                )
-            else:
-                causal_mask_creation_function = getattr(
-                    base_model, "_prepare_4d_causal_attention_mask_with_cache_position", None
-                )
-            if causal_mask_creation_function is None:
-                logger.warning_once(
-                    f"{self.__class__.__name__} has no `_prepare_4d_causal_attention_mask_with_cache_position` method "
-                    "defined in its base modeling class. Compiled forward passes will be sub-optimal. If you're "
-                    "writing code, see Llama for an example implementation. If you're a user, please report this "
-                    "issue on GitHub."
-                )
-            else:
-                attention_mask = causal_mask_creation_function(
-                    attention_mask,
-                    sequence_length=sequence_length,
-                    target_length=past_key_values.get_max_cache_shape(),
-                    dtype=self.dtype,
-                    device=device,
-                    cache_position=cache_position,
-                    batch_size=batch_size,
-                    config=self.config,
-                    past_key_values=past_key_values,
-                )
-        if attention_mask is not None:
-            model_inputs["attention_mask"] = attention_mask
-
-        # 7. Forward ALL kwargs that are uninitialized (e.g. `use_cache`).
-        for key, value in kwargs.items():
-            if key not in model_inputs:
-                model_inputs[key] = value
+        model_inputs.update(**kwargs)
 
         # 8. Remove unexpected `generate` inputs (TODO @joao: fix trainer and examples)
         model_inputs.pop("labels", None)
-        return model_inputs
+
+        return model_inputs        
 
 @add_start_docstrings(
     """
