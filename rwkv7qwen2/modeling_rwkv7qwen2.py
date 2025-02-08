@@ -394,6 +394,13 @@ class RWKV7Attention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
+        if attention_mask is not None:
+            assert len(attention_mask.shape) == 2, (
+                "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
+                "for padding purposes (0 indicating padding). "
+                "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
+            )
+        
         output_shift_state = hidden_states[:, -1:].detach().clone()
 
         x = hidden_states
@@ -407,6 +414,10 @@ class RWKV7Attention(nn.Module):
             input_vk_state, input_shift_state = past_key_values[self.layer_idx]
         else:
             input_vk_state, input_shift_state = torch.zeros(B,H,N,N, dtype=torch.float32,device=x.device), torch.zeros_like(x[:, -1:])
+
+        # NOTE - no need for this without tokenshift
+        # if attention_mask is not None:
+        #     hidden_states = hidden_states.mul(attention_mask[:, -hidden_states.shape[-2]:, None])
 
         # shifted = torch.cat([input_shift_state, x[:, :-1]], dim=1)
         # xx = shifted - x
@@ -426,16 +437,17 @@ class RWKV7Attention(nn.Module):
         v = self.v_proj(xv)
         a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2)
         g = torch.sigmoid(xg @ self.g1) @ self.g2
-
-        r = r.view(B,T,-1,N)
-        k = k.view(B,T,-1,N)
-        # r = r.transpose(1,2) # BHTN
-        # k = k.transpose(1,2) # B(kvh)TN
-        cos, sin = position_embeddings
-        # cos, sin = shared.angles.unbind(0)
-        r, k = apply_rotary_pos_emb(r, k, cos, sin, unsqueeze_dim=2)
-        # r = r.transpose(1,2).view(B,T,-1).to(v.dtype)
-        # k = k.transpose(1,2).view(B,T,-1).to(v.dtype)
+        
+        if position_embeddings is not None:
+            r = r.view(B,T,-1,N)
+            k = k.view(B,T,-1,N)
+            # r = r.transpose(1,2) # BHTN
+            # k = k.transpose(1,2) # B(kvh)TN
+            cos, sin = position_embeddings
+            # cos, sin = shared.angles.unbind(0)
+            r, k = apply_rotary_pos_emb(r, k, cos, sin, unsqueeze_dim=2)
+            # r = r.transpose(1,2).view(B,T,-1).to(v.dtype)
+            # k = k.transpose(1,2).view(B,T,-1).to(v.dtype)
 
         # repeat k/v heads if n_kv_heads < n_heads
         k = k.view(B, T, -1, 1, self.head_dim).expand(-1, -1, -1, self.num_key_value_groups, -1).reshape(B, T, -1)
@@ -449,6 +461,10 @@ class RWKV7Attention(nn.Module):
         if self.layer_idx == 0: v_first = v
         else: v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)        
 
+        # dealing with left-padding
+        if attention_mask is not None:
+            v = v * attention_mask[:, -v.shape[-2]:, None]
+            
         xx = x
         # if T == 1 or not self.training:
         #     w = torch.exp(-0.606531 * torch.sigmoid(w_lora_result)) # 0.606531 = exp(-0.5)
