@@ -160,6 +160,7 @@ class RWKV7Qwen2Config(PretrainedConfig):
         use_sliding_window=False,
         sliding_window=4096,
         max_window_layers=28,
+        num_attention_layers=0,
         attention_dropout=0.0,
         attention_bias=True,
         attention_output_bias=False,
@@ -174,6 +175,7 @@ class RWKV7Qwen2Config(PretrainedConfig):
         self.use_sliding_window = use_sliding_window
         self.sliding_window = sliding_window if use_sliding_window else None
         self.max_window_layers = max_window_layers
+        self.num_attention_layers = num_attention_layers
 
         # for backward compatibility
         if num_key_value_heads is None:

@@ -50,7 +50,7 @@ from transformers.utils import (
 )
 from .configuration_rwkv7qwen2 import RWKV7Qwen2Config
 
-from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2MLP, Qwen2RMSNorm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2MLP, Qwen2RMSNorm, Qwen2Attention
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 logger = logging.get_logger(__name__)
@@ -478,7 +478,7 @@ class RWKV7Attention(nn.Module):
         #     # FIXME - support fast triton kernel for non-training pre-fill with state in and out
         # else:
         # FIXME - can simplify to 
-        # log_w = -math.exp(-0.5) * torch.sigmoid(w_lora_result)
+        # log_w = -math.exp(-0.5) * torch.sigmoid(w_lora_result.float())
         log_neglog_w = - 0.5 - torch.nn.functional.softplus(-w_lora_result)
         log_w = -log_neglog_w.float().exp()
 
@@ -503,7 +503,10 @@ class RWKV7Qwen2DecoderLayer(nn.Module):
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
 
-        self.self_attn = RWKV7Attention(config, layer_idx) #QWEN2_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+        if layer_idx >= config.num_hidden_layers - config.num_attention_layers:
+            self.self_attn = Qwen2Attention(config=config, layer_idx=layer_idx)
+        else:
+            self.self_attn = RWKV7Attention(config, layer_idx)
 
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -697,7 +700,7 @@ class RWKV7Qwen2Model(RWKV7Qwen2PreTrainedModel):
         )
         self._attn_implementation = config._attn_implementation
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        #self.rotary_emb = Qwen2RotaryEmbedding(config=config)
+        self.rotary_emb = Qwen2RotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -765,8 +768,8 @@ class RWKV7Qwen2Model(RWKV7Qwen2PreTrainedModel):
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings = None
-        #position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        #position_embeddings = None
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
